@@ -20,6 +20,54 @@ struct FaultSource {
 
 struct FaultOpen(bool);
 
+struct MetadataFaultSource;
+
+impl rustic_core::ReadSource for MetadataFaultSource {
+    type Open = FaultOpen;
+    type Iter = <FaultSource as rustic_core::ReadSource>::Iter;
+
+    fn size(&self) -> rustic_core::RusticResult<Option<u64>> {
+        Ok(None)
+    }
+    fn entries(&self) -> Self::Iter {
+        // Model the legacy mapper, which used to hide metadata read failures.
+        FaultSource { fail_open: false }
+            .entries()
+            .flatten()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+    fn strict_entries(&self) -> Self::Iter {
+        FaultSource { fail_open: false }.entries()
+    }
+}
+
+#[rstest]
+fn strict_backup_selects_metadata_errors_without_an_admission_scan(
+    set_up_repo: Result<RepoOpen>,
+) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    assert!(
+        repo.archive(
+            &BackupOptions::default().strict(true).no_scan(true),
+            &MetadataFaultSource,
+            SnapshotFile::default(),
+            &[PathBuf::from("test")]
+        )
+        .is_err()
+    );
+    assert!(repo.get_all_snapshots()?.is_empty());
+    let _snapshot = repo.archive(
+        &BackupOptions::default().no_scan(true),
+        &MetadataFaultSource,
+        SnapshotFile::default(),
+        &[PathBuf::from("test")],
+    )?;
+    assert_eq!(repo.get_all_snapshots()?.len(), 1);
+    Ok(())
+}
+
 impl rustic_core::ReadSourceOpen for FaultOpen {
     type Reader = std::io::Cursor<Vec<u8>>;
     fn open(self) -> rustic_core::RusticResult<Self::Reader> {

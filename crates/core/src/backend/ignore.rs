@@ -296,6 +296,15 @@ impl ReadSource for LocalSource {
         LocalSourceWalker {
             walker: self.builder.build(),
             save_opts: self.save_opts,
+            strict_metadata: false,
+        }
+    }
+
+    fn strict_entries(&self) -> Self::Iter {
+        LocalSourceWalker {
+            walker: self.builder.build(),
+            save_opts: self.save_opts,
+            strict_metadata: true,
         }
     }
 
@@ -303,6 +312,7 @@ impl ReadSource for LocalSource {
         Some(LocalSourceWalker {
             walker: self.inventory_builder.build(),
             save_opts: self.save_opts,
+            strict_metadata: true,
         })
     }
 }
@@ -314,6 +324,7 @@ pub struct LocalSourceWalker {
     walker: Walk,
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
+    strict_metadata: bool,
 }
 
 impl Iterator for LocalSourceWalker {
@@ -329,14 +340,17 @@ impl Iterator for LocalSourceWalker {
         }
         .map(|e| {
             self.save_opts
-                .map_entry(e.map_err(|err| {
-                    RusticError::with_source(
-                        ErrorKind::Internal,
-                        "Failed to get next entry from walk iterator.",
-                        err,
-                    )
-                    .ask_report()
-                })?)
+                .map_entry_with_metadata_strictness(
+                    e.map_err(|err| {
+                        RusticError::with_source(
+                            ErrorKind::Internal,
+                            "Failed to get next entry from walk iterator.",
+                            err,
+                        )
+                        .ask_report()
+                    })?,
+                    self.strict_metadata,
+                )
                 .map_err(|err| {
                     RusticError::with_source(
                         ErrorKind::Internal,

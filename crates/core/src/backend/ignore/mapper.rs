@@ -79,6 +79,14 @@ impl LocalSourceSaveOptions {
     /// * If metadata could not be read.
     /// * If the xattr of the entry could not be read.
     pub fn map_entry(self, entry: DirEntry) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
+        self.map_entry_with_metadata_strictness(entry, false)
+    }
+
+    pub(crate) fn map_entry_with_metadata_strictness(
+        self,
+        entry: DirEntry,
+        strict_metadata: bool,
+    ) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
         let name = entry.file_name();
         let m = entry
             .metadata()
@@ -105,12 +113,10 @@ impl LocalSourceSaveOptions {
             .set_devid
             .unwrap_or_default()
             .map_or_else(|| Self::device_id(&m), Self::hardlink(&m));
-        let xattr = || {
-            Self::xattrs(entry.path())
-                .inspect_err(|err| warn!("ignoring error obtaining xargs: {err}"))
-                .unwrap_or_default()
-        };
-        let extended_attributes = self.set_xattrs.unwrap_or_default().map_or_else(xattr);
+        let extended_attributes =
+            read_xattrs(self.set_xattrs.unwrap_or_default(), strict_metadata, || {
+                Self::xattrs(entry.path())
+            })?;
         let (mode, inode, links) = Self::nix_infos(&m);
 
         let meta = Metadata {
@@ -156,6 +162,72 @@ impl LocalSourceSaveOptions {
             self.to_node_other(name, m, meta)
         };
         Ok(node)
+    }
+}
+
+fn read_xattrs(
+    option: XattrOption,
+    strict: bool,
+    read: impl FnOnce() -> IgnoreResult<Vec<ExtendedAttribute>>,
+) -> IgnoreResult<Vec<ExtendedAttribute>> {
+    if option == XattrOption::No {
+        return Ok(Vec::new());
+    }
+    match read() {
+        Ok(attributes) => Ok(attributes),
+        Err(error) if strict => Err(error),
+        Err(error) => {
+            warn!("ignoring error obtaining xattrs: {error}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[cfg(all(test, not(any(windows, target_os = "openbsd"))))]
+mod strict_metadata_tests {
+    use super::*;
+
+    fn denied() -> IgnoreResult<Vec<ExtendedAttribute>> {
+        Err(IgnoreErrorKind::ErrorXattr {
+            path: "file".into(),
+            source: std::io::ErrorKind::PermissionDenied.into(),
+        })
+    }
+
+    #[test]
+    fn strict_metadata_does_not_substitute_empty_xattrs_on_read_failure() {
+        assert!(read_xattrs(XattrOption::Yes, true, denied).is_err());
+        assert!(
+            read_xattrs(XattrOption::Yes, false, denied)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn intentional_scope_exclusion_does_not_read_attributes() {
+        assert!(
+            read_xattrs(XattrOption::No, true, || panic!("must not read"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn strict_metadata_preserves_empty_and_nonempty_attributes() {
+        assert!(
+            read_xattrs(XattrOption::Yes, true, || Ok(Vec::new()))
+                .unwrap()
+                .is_empty()
+        );
+        let attributes = vec![ExtendedAttribute {
+            name: "user.test".into(),
+            value: Some(vec![1, 2, 3]),
+        }];
+        assert_eq!(
+            read_xattrs(XattrOption::Yes, true, || Ok(attributes.clone())).unwrap(),
+            attributes
+        );
     }
 }
 

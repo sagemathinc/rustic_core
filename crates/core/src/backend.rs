@@ -579,6 +579,12 @@ pub trait ReadSource: Sync + Send {
     /// Returns an iterator over the entries of the source.
     fn entries(&self) -> Self::Iter;
 
+    /// Entries for strict backup: metadata failures must be yielded as errors.
+    /// Sources with legacy best-effort metadata handling must override this.
+    fn strict_entries(&self) -> Self::Iter {
+        self.entries()
+    }
+
     /// Metadata-only inventory with known regular-file sizes, or `None` for streams.
     /// Implementations must not open contents and should not buffer a whole directory.
     /// Inspection errors must be yielded, never silently omitted.

@@ -167,7 +167,12 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             });
 
             // filter out errors and handle as_path
-            let iter = src.entries().filter_map(|item| match item {
+            let entries = if self.strict {
+                src.strict_entries()
+            } else {
+                src.entries()
+            };
+            let iter = entries.filter_map(|item| match item {
                 Err(err) => {
                     incomplete.store(true, Ordering::Relaxed);
                     warn!("ignoring error: {}", err.display_log());
