@@ -1,11 +1,13 @@
 use std::io::Read;
 
+use super::Chunk;
+use crate::backend::source_reader::SourceReader;
 use crate::error::{ErrorKind, RusticError, RusticResult};
 
 /// `ChunkIter` is an iterator that chunks data.
 pub(crate) struct ChunkIter<R: Read + Send> {
     /// The reader.
-    reader: R,
+    reader: SourceReader<R>,
 
     /// The size hint is used to optimize memory allocation; this should be an upper bound on the size.
     size_hint: usize,
@@ -25,7 +27,12 @@ impl<R: Read + Send> ChunkIter<R> {
     /// * `reader` - The reader to read from.
     /// * `size_hint` - The size hint is used to optimize memory allocation; this should be an upper bound on the size.
     /// * `rabin` - The rolling hash.
+    #[cfg(test)]
     pub(crate) fn new(size: usize, reader: R, size_hint: usize) -> Self {
+        Self::new_with_holes(size, SourceReader::plain(reader), size_hint)
+    }
+
+    pub(crate) fn new_with_holes(size: usize, reader: SourceReader<R>, size_hint: usize) -> Self {
         Self {
             reader,
             size_hint, // size hint is used to optimize memory allocation; this should be an upper bound on the size
@@ -35,12 +42,26 @@ impl<R: Read + Send> ChunkIter<R> {
     }
 }
 
-impl<R: Read + Send> Iterator for ChunkIter<R> {
-    type Item = RusticResult<Vec<u8>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<R: Read + Send> ChunkIter<R> {
+    pub(super) fn next_sparse_chunk(&mut self) -> Option<RusticResult<Chunk>> {
         if self.finished {
             return None;
+        }
+
+        match self.reader.skip_hole(self.size) {
+            Ok(true) => {
+                self.size_hint = self.size_hint.saturating_sub(self.size);
+                return Some(Ok(Chunk::Zeros(self.size)));
+            }
+            Ok(false) => (),
+            Err(err) => {
+                self.finished = true;
+                return Some(Err(RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to discover source holes.",
+                    err,
+                )));
+            }
         }
 
         let mut vec = Vec::with_capacity(self.size_hint.min(self.size));
@@ -66,7 +87,20 @@ impl<R: Read + Send> Iterator for ChunkIter<R> {
             vec.truncate(size);
         }
         self.size_hint = self.size_hint.saturating_sub(vec.len()); // size_hint can be too small!
-        if vec.is_empty() { None } else { Some(Ok(vec)) }
+        if vec.is_empty() {
+            None
+        } else {
+            Some(Ok(Chunk::Data(vec)))
+        }
+    }
+}
+
+#[cfg(test)]
+impl<R: Read + Send> Iterator for ChunkIter<R> {
+    type Item = RusticResult<Vec<u8>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_sparse_chunk()
+            .map(|chunk| chunk.map(Chunk::into_bytes))
     }
 }
 

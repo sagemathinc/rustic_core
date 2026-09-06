@@ -223,6 +223,16 @@ pub struct OpenFile(PathBuf);
 impl ReadSourceOpen for OpenFile {
     type Reader = File;
 
+    fn open_with_holes(self) -> RusticResult<super::source_reader::SourceReader<File>> {
+        super::source_reader::SourceReader::file(self.open()?).map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::InputOutput,
+                "Failed to initialize local file reader.",
+                err,
+            )
+        })
+    }
+
     /// Open the file from the local backend.
     ///
     /// # Returns

@@ -6,10 +6,10 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
+use std::{cmp::Ordering, collections::BTreeMap, io::Read, path::PathBuf, sync::Mutex};
 
 use itertools::Itertools;
-use rayon::ThreadPoolBuilder;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::{
@@ -67,10 +67,15 @@ pub struct RestoreOptions {
 
 #[derive(Serialize, Default, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+/// How zero ranges are written during restore.
 pub enum SparseRestore {
+    /// Write all bytes, including zeros.
     #[default]
     No,
+    /// Punch zero ranges where supported, otherwise write actual zeros.
     ByContent,
+    /// Like `ByContent`, but fail instead of writing dense zeros when hole punching is unsupported.
+    ByContentRequired,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -596,37 +601,41 @@ fn restore_contents<S: Open>(
             .attach_context("num_threads", threads.to_string())
         })?;
 
-    pool.in_place_scope(|s| {
-        for PackInfo {
-            pack_id,
-            from_file,
-            locations:
-                BlobLocations {
-                    offset,
-                    length,
-                    blobs,
-                },
-        } in packs
-        {
-            let p = &p;
-
-            if !blobs.is_empty() {
-                // TODO: error handling!
-                s.spawn(move |s1| {
+    // try_for_each joins in-flight work before returning an I/O error. A restore
+    // failure must not panic in a detached task or report successful completion.
+    pool.install(|| {
+        packs.into_par_iter().try_for_each(
+            |PackInfo {
+                 pack_id,
+                 from_file,
+                 locations:
+                     BlobLocations {
+                         offset,
+                         length,
+                         blobs,
+                     },
+             }|
+             -> RusticResult<()> {
+                if !blobs.is_empty() {
                     let read_data = match &from_file {
                         Some((file_idx, offset_file, length_file)) => {
                             // read from existing file
                             dest.read_at(&filenames[*file_idx], *offset_file, (*length_file).into())
-                                .unwrap()
+                                .map_err(|err| {
+                                    RusticError::with_source(
+                                        ErrorKind::InputOutput,
+                                        "Failed to read existing restore contents.",
+                                        err,
+                                    )
+                                })?
                         }
                         None => {
                             // read needed part of the pack
-                            be.read_partial(FileType::Pack, &pack_id, false, offset, length)
-                                .unwrap()
+                            be.read_partial(FileType::Pack, &pack_id, false, offset, length)?
                         }
                     };
 
-                    // save into needed files in parallel
+                    // Parallelize packs, not one queued task per repeated chunk reference.
                     for (bl, name_dests) in blobs {
                         let size = bl.data_length().into();
                         let data = if from_file.is_some() {
@@ -639,37 +648,56 @@ fn restore_contents<S: Open>(
                             be.read_encrypted_from_partial(
                                 &read_data[start..end],
                                 bl.uncompressed_length,
-                            )
-                            .unwrap()
-                        };
-                        let is_sparse = match sparse {
-                            SparseRestore::ByContent => data.iter().all(|&b| b == 0),
-                            SparseRestore::No => false,
+                            )?
                         };
 
+                        let zero_ranges = (sparse != SparseRestore::No)
+                            .then(|| crate::backend::sparse::ZeroRanges::new(&data));
                         for (file_idx, start) in name_dests {
-                            let data = data.clone();
-                            s1.spawn(move |_| {
-                                let path = &filenames[file_idx];
-                                // Allocate file if it is not yet allocated
-                                let mut sizes_guard = sizes.lock().unwrap();
-                                let filesize = sizes_guard[file_idx];
-                                if filesize > 0 {
-                                    dest.set_length(path, filesize).unwrap();
-                                    sizes_guard[file_idx] = 0;
-                                }
-                                drop(sizes_guard);
-                                if !is_sparse {
-                                    dest.write_at(path, start, &data).unwrap();
-                                }
-                                p.inc(size);
-                            });
+                            let path = &filenames[file_idx];
+                            // Allocate file if it is not yet allocated
+                            let mut sizes_guard = sizes.lock().unwrap();
+                            let filesize = sizes_guard[file_idx];
+                            if filesize > 0 {
+                                dest.set_length(path, filesize).map_err(|err| {
+                                    RusticError::with_source(
+                                        ErrorKind::InputOutput,
+                                        "Failed to set restore file length for `{path}`.",
+                                        err,
+                                    )
+                                    .attach_context("path", path.display().to_string())
+                                })?;
+                                sizes_guard[file_idx] = 0;
+                            }
+                            drop(sizes_guard);
+                            match sparse {
+                                SparseRestore::No => dest.write_at(path, start, &data),
+                                SparseRestore::ByContent | SparseRestore::ByContentRequired => dest
+                                    .write_sparse_at(
+                                        path,
+                                        start,
+                                        &data,
+                                        sparse == SparseRestore::ByContentRequired,
+                                        zero_ranges.as_ref().expect("sparse ranges were computed"),
+                                    ),
+                            }
+                            .map_err(|err| {
+                                RusticError::with_source(
+                                    ErrorKind::InputOutput,
+                                    "Failed to write restore contents for `{path}` at `{offset}`.",
+                                    err,
+                                )
+                                .attach_context("path", path.display().to_string())
+                                .attach_context("offset", start.to_string())
+                            })?;
+                            p.inc(size);
                         }
                     }
-                });
-            }
-        }
-    });
+                }
+                Ok(())
+            },
+        )
+    })?;
 
     p.finish();
 
@@ -799,6 +827,18 @@ impl RestorePlan {
 
         let file_idx = self.names.len();
         self.names.push(name);
+        let mut open_file = open_file
+            .take()
+            .map(crate::backend::source_reader::SourceReader::<std::fs::File>::file)
+            .transpose()
+            .map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to open sparse verification reader.",
+                    err,
+                )
+            })?;
+        let mut zero_hash = None;
         let mut file_pos = 0;
         let mut has_unmatched = false;
         for id in file.content.iter().flatten() {
@@ -806,9 +846,10 @@ impl RestorePlan {
             let bl = ie.location;
             let length: u64 = bl.data_length().into();
 
-            let matches = open_file
-                .as_mut()
-                .is_some_and(|file| id.blob_matches_reader(length, file));
+            let matches = match open_file.as_mut() {
+                None => false,
+                Some(file) => blob_matches_with_holes(id, length, file, &mut zero_hash)?,
+            };
 
             let blob_location = self.r.entry((ie.pack, bl)).or_default();
             blob_location.push(FileLocation {
@@ -849,4 +890,43 @@ impl RestorePlan {
             .dedup()
             .collect()
     }
+}
+
+/// Verify discovered holes by their zero-content hash, without reading their logical bytes.
+fn blob_matches_with_holes(
+    id: &crate::blob::DataId,
+    length: u64,
+    file: &mut crate::backend::source_reader::SourceReader<std::fs::File>,
+    zero_hash: &mut Option<(u64, crate::blob::DataId)>,
+) -> RusticResult<bool> {
+    let length_usize = usize::try_from(length).map_err(|err| {
+        RusticError::with_source(ErrorKind::InputOutput, "Invalid verification length.", err)
+    })?;
+    let hole = file.skip_hole(length_usize).map_err(|err| {
+        RusticError::with_source(
+            ErrorKind::InputOutput,
+            "Failed to discover verification holes.",
+            err,
+        )
+    })?;
+    if !hole {
+        return Ok(id.blob_matches_reader(length, file));
+    }
+    let expected = match *zero_hash {
+        Some((size, hash)) if size == length => hash,
+        _ => {
+            let hash = crate::crypto::hasher::hash_reader(std::io::repeat(0).take(length))
+                .map_err(|err| {
+                    RusticError::with_source(
+                        ErrorKind::InputOutput,
+                        "Failed to hash zero chunk.",
+                        err,
+                    )
+                })?
+                .into();
+            *zero_hash = Some((length, hash));
+            hash
+        }
+    };
+    Ok(*id == expected)
 }

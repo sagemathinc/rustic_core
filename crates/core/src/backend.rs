@@ -7,6 +7,8 @@ pub(crate) mod hotcold;
 pub(crate) mod ignore;
 pub(crate) mod local_destination;
 pub(crate) mod node;
+pub mod source_reader;
+pub(crate) mod sparse;
 pub(crate) mod stdin;
 pub(crate) mod warm_up;
 
@@ -533,6 +535,17 @@ pub trait ReadSourceOpen {
     ///
     /// The reader used to read from the source.
     fn open(self) -> RusticResult<Self::Reader>;
+
+    /// Open a reader with optional hole discovery. Non-file sources use ordinary reads.
+    ///
+    /// # Errors
+    /// Returns the source's open error.
+    fn open_with_holes(self) -> RusticResult<source_reader::SourceReader<Self::Reader>>
+    where
+        Self: Sized,
+    {
+        self.open().map(source_reader::SourceReader::plain)
+    }
 }
 
 /// blanket implementation for readers

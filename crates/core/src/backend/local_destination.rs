@@ -584,7 +584,7 @@ impl LocalDestination {
     ///
     /// # Notes
     ///
-    /// If the file exists, truncate it to the given length. (TODO: check if this is correct)
+    /// Existing bytes within the new length are preserved for matching-chunk reuse.
     /// If it doesn't exist, create a new (empty) one with given length.
     pub(crate) fn set_length(
         &self,
@@ -835,6 +835,24 @@ impl LocalDestination {
         Ok(())
     }
 
+    /// Write sparse contents without leaving stale bytes in an existing destination.
+    /// The restore planner has already set the final file length.
+    pub(crate) fn write_sparse_at(
+        &self,
+        item: impl AsRef<Path>,
+        offset: u64,
+        data: &[u8],
+        required: bool,
+        ranges: &super::sparse::ZeroRanges,
+    ) -> LocalDestinationResult<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(self.path(item))
+            .map_err(LocalDestinationErrorKind::OpeningFileFailed)?;
+        super::sparse::write_sparse(&mut file, offset, data, required, ranges)
+            .map_err(LocalDestinationErrorKind::CouldNotWriteToBuffer)
+    }
+
     /// Create a hardlink `item` pointing to `source_item`, both relative to the base path.
     ///
     /// # Arguments
@@ -858,12 +876,40 @@ impl LocalDestination {
             .parent()
             .ok_or_else(|| LocalDestinationErrorKind::FileDoesNotHaveParent(filename.clone()))?;
         fs::create_dir_all(dir).map_err(LocalDestinationErrorKind::DirectoryCreationFailed)?;
-        fs::hard_link(&source_path, &filename).map_err(|err| {
-            LocalDestinationErrorKind::HardLinkingFailed {
-                source_path,
-                filename,
-                source: err,
+        // Publish the replacement atomically; removing the destination first
+        // would lose it if link creation failed (e.g. quota or permission error).
+        let link_result = (|| -> std::io::Result<()> {
+            match fs::hard_link(&source_path, &filename) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(err) => return Err(err),
             }
+            for _ in 0..16 {
+                let temporary =
+                    dir.join(format!(".rustic-hardlink-{:016x}", rand::random::<u64>()));
+                match fs::hard_link(&source_path, &temporary) {
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    result => result?,
+                }
+                let result = fs::rename(&temporary, &filename);
+                // rename may be a no-op when both paths already refer to the same inode.
+                let cleanup = fs::remove_file(&temporary);
+                result?;
+                match cleanup {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+                    result => result?,
+                }
+                return Ok(());
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not create a temporary hardlink",
+            ))
+        })();
+        link_result.map_err(|err| LocalDestinationErrorKind::HardLinkingFailed {
+            source_path,
+            filename,
+            source: err,
         })?;
         Ok(())
     }

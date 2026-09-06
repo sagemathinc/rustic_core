@@ -3,6 +3,8 @@ use std::io::{self, Read};
 use rand::{RngExt, rng};
 use rustic_cdc::{Polynom, Polynom64, Rabin64, RollingHash64};
 
+use super::Chunk;
+use crate::backend::source_reader::SourceReader;
 use crate::error::{ErrorKind, RusticError, RusticResult};
 
 pub(super) mod constants {
@@ -50,7 +52,7 @@ pub(crate) struct ChunkIter<R: Read + Send> {
     pos: usize,
 
     /// The reader.
-    reader: R,
+    reader: SourceReader<R>,
 
     /// The split mask used to determine if a chunk is a chunk boundary.
     split_mask: u64,
@@ -79,12 +81,31 @@ impl<R: Read + Send> ChunkIter<R> {
     /// * `reader` - The reader to read from.
     /// * `size_hint` - The size hint is used to optimize memory allocation; this should be an upper bound on the size.
     /// * `rabin` - The rolling hash.
+    #[cfg(test)]
     pub(crate) fn new(
         rabin: Rabin64,
         chunk_size: usize,
         chunk_min_size: usize,
         chunk_max_size: usize,
         reader: R,
+        size_hint: usize,
+    ) -> RusticResult<Self> {
+        Self::new_with_holes(
+            rabin,
+            chunk_size,
+            chunk_min_size,
+            chunk_max_size,
+            SourceReader::plain(reader),
+            size_hint,
+        )
+    }
+
+    pub(crate) fn new_with_holes(
+        rabin: Rabin64,
+        chunk_size: usize,
+        chunk_min_size: usize,
+        chunk_max_size: usize,
+        reader: SourceReader<R>,
         size_hint: usize,
     ) -> RusticResult<Self> {
         check_rabin_params(chunk_size, chunk_min_size, chunk_max_size)?;
@@ -104,12 +125,35 @@ impl<R: Read + Send> ChunkIter<R> {
     }
 }
 
-impl<R: Read + Send> Iterator for ChunkIter<R> {
-    type Item = RusticResult<Vec<u8>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<R: Read + Send> ChunkIter<R> {
+    pub(super) fn next_sparse_chunk(&mut self) -> Option<RusticResult<Chunk>> {
         if self.finished {
             return None;
+        }
+
+        // A fresh all-zero minimum chunk resets the Rabin window to zero,
+        // satisfying every split mask. Include lookahead left by the prior chunk.
+        let buffered = self.buf.len() - self.pos;
+        if self.min_size >= 64
+            && buffered < self.min_size
+            && self.buf[self.pos..].iter().all(|byte| *byte == 0)
+        {
+            match self.reader.skip_hole(self.min_size - buffered) {
+                Ok(true) => {
+                    self.pos = self.buf.len();
+                    self.size_hint = self.size_hint.saturating_sub(self.min_size);
+                    return Some(Ok(Chunk::Zeros(self.min_size)));
+                }
+                Ok(false) => (),
+                Err(err) => {
+                    self.finished = true;
+                    return Some(Err(RusticError::with_source(
+                        ErrorKind::InputOutput,
+                        "Failed to discover source holes.",
+                        err,
+                    )));
+                }
+            }
         }
 
         let mut min_size = self.min_size;
@@ -143,7 +187,11 @@ impl<R: Read + Send> Iterator for ChunkIter<R> {
         if size < min_size {
             self.finished = true;
             vec.truncate(size + open_buf_len);
-            return if vec.is_empty() { None } else { Some(Ok(vec)) };
+            return if vec.is_empty() {
+                None
+            } else {
+                Some(Ok(Chunk::Data(vec)))
+            };
         }
 
         _ = self
@@ -187,7 +235,16 @@ impl<R: Read + Send> Iterator for ChunkIter<R> {
             self.rabin.slide(byte);
         }
         self.size_hint = self.size_hint.saturating_sub(vec.len()); // size_hint can be too small!
-        Some(Ok(vec))
+        Some(Ok(Chunk::Data(vec)))
+    }
+}
+
+#[cfg(test)]
+impl<R: Read + Send> Iterator for ChunkIter<R> {
+    type Item = RusticResult<Vec<u8>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_sparse_chunk()
+            .map(|chunk| chunk.map(Chunk::into_bytes))
     }
 }
 

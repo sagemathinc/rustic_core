@@ -10,12 +10,13 @@ use crate::{
         ReadSourceOpen,
         decrypt::DecryptWriteBackend,
         node::{Node, NodeType},
+        source_reader::SourceReader,
     },
     blob::{
         BlobId, BlobType, DataId,
         packer::{PackSizer, Packer, PackerStats},
     },
-    chunker::ChunkIter,
+    chunker::{Chunk, ChunkIter},
     crypto::hasher::hash,
     error::{ErrorKind, RusticError, RusticResult},
     index::{ReadGlobalIndex, indexer::SharedIndexer},
@@ -114,7 +115,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                             .attach_context("path", path.display().to_string())
                             .ask_report(),
                         )?
-                        .open()
+                        .open_with_holes()
                         .map_err(|err| {
                             err
                             .overwrite_kind(ErrorKind::InputOutput)
@@ -137,30 +138,49 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     // TODO: add documentation!
     fn backup_reader(
         &self,
-        r: impl Read + Send + 'static,
+        r: SourceReader<impl Read + Send + 'static>,
         node: Node,
         p: &Progress,
     ) -> RusticResult<(Node, u64)> {
-        let chunks: Vec<_> = ChunkIter::from_config(
+        let mut zero_chunk = None;
+        let mut content = Vec::new();
+        let mut filesize = 0u64;
+        for chunk in ChunkIter::from_config(
             &self.config,
             r,
             usize::try_from(node.meta.size).unwrap_or(usize::MAX),
-        )?
-        .map(|chunk| {
-            let chunk = chunk?;
-            let id = hash(&chunk);
-            let size = chunk.len() as u64;
-
-            if !self.index.has_data(&DataId::from(id)) {
-                self.data_packer.add(chunk.into(), BlobId::from(id))?;
-            }
+        )? {
+            let (id, size) = match chunk? {
+                Chunk::Data(chunk) => {
+                    let id = hash(&chunk);
+                    let size = chunk.len() as u64;
+                    if !self.index.has_data(&DataId::from(id)) {
+                        self.data_packer.add(chunk.into(), BlobId::from(id))?;
+                    }
+                    (DataId::from(id), size)
+                }
+                Chunk::Zeros(size) => {
+                    let id = match zero_chunk {
+                        Some((cached_size, id)) if cached_size == size => id,
+                        _ => {
+                            let chunk = vec![0; size];
+                            let id = hash(&chunk);
+                            if !self.index.has_data(&DataId::from(id)) {
+                                self.data_packer.add(chunk.into(), BlobId::from(id))?;
+                            }
+                            zero_chunk = Some((size, DataId::from(id)));
+                            DataId::from(id)
+                        }
+                    };
+                    (id, size as u64)
+                }
+            };
             p.inc(size);
-            Ok((DataId::from(id), size))
-        })
-        .collect::<RusticResult<_>>()?;
-
-        let filesize = chunks.iter().map(|x| x.1).sum();
-        let content = chunks.into_iter().map(|x| x.0).collect();
+            filesize = filesize.checked_add(size).ok_or_else(|| {
+                RusticError::new(ErrorKind::InputOutput, "Backup file size overflow.")
+            })?;
+            content.push(id);
+        }
 
         let mut node = node;
         node.content = Some(content);
