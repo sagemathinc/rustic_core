@@ -110,6 +110,7 @@ This crate exposes a few features for controlling dependency usage.
 
 pub(crate) mod archiver;
 pub(crate) mod backend;
+pub(crate) mod backup_inventory;
 pub(crate) mod blob;
 pub(crate) mod chunker;
 pub(crate) mod commands;
@@ -145,6 +146,7 @@ pub use crate::{
         source_reader::SourceReader,
         stdin::StdinSource,
     },
+    backup_inventory::{BackupAdmissionOptions, BackupInventory, backup_inventory},
     blob::{
         BlobId, DataId, PackedId,
         tree::{

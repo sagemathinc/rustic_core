@@ -56,6 +56,8 @@ pub(crate) type IgnoreResult<T> = Result<T, IgnoreErrorKind>;
 pub struct LocalSource {
     /// The walk builder.
     builder: WalkBuilder,
+    /// Unsorted traversal avoids collecting a huge directory before its admission limit.
+    inventory_builder: WalkBuilder,
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
 }
@@ -152,7 +154,6 @@ impl LocalSource {
             .git_ignore(filter_opts.git_ignore)
             .git_exclude(filter_opts.git_ignore)
             .require_git(!filter_opts.no_require_git)
-            .sort_by_file_path(Path::cmp)
             .same_file_system(filter_opts.one_file_system)
             .max_filesize(filter_opts.exclude_larger_than.map(|s| s.as_u64()))
             .overrides(overrides);
@@ -210,9 +211,15 @@ impl LocalSource {
             });
         }
 
+        let inventory_builder = walk_builder.clone();
+        _ = walk_builder.sort_by_file_path(Path::cmp);
         let builder = walk_builder;
 
-        Ok(Self { builder, save_opts })
+        Ok(Self {
+            builder,
+            inventory_builder,
+            save_opts,
+        })
     }
 }
 
@@ -290,6 +297,13 @@ impl ReadSource for LocalSource {
             walker: self.builder.build(),
             save_opts: self.save_opts,
         }
+    }
+
+    fn inventory_entries(&self) -> Option<Self::Iter> {
+        Some(LocalSourceWalker {
+            walker: self.inventory_builder.build(),
+            save_opts: self.save_opts,
+        })
     }
 }
 

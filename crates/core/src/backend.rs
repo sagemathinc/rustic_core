@@ -578,6 +578,13 @@ pub trait ReadSource: Sync + Send {
 
     /// Returns an iterator over the entries of the source.
     fn entries(&self) -> Self::Iter;
+
+    /// Metadata-only inventory with known regular-file sizes, or `None` for streams.
+    /// Implementations must not open contents and should not buffer a whole directory.
+    /// Inspection errors must be yielded, never silently omitted.
+    fn inventory_entries(&self) -> Option<Self::Iter> {
+        None
+    }
 }
 
 /// The backends a repository can be initialized and operated on

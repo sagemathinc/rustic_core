@@ -10,7 +10,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
 use crate::{
-    CommandInput, Excludes, ReadSource,
+    BackupAdmissionOptions, CommandInput, Excludes, ReadSource,
     archiver::{Archiver, parent::Parent},
     backend::{
         childstdout::ChildStdoutSource,
@@ -18,6 +18,7 @@ use crate::{
         ignore::{LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions},
         stdin::StdinSource,
     },
+    backup_inventory,
     error::{ErrorKind, RusticError, RusticResult},
     repofile::{
         PathList, SnapshotFile,
@@ -176,6 +177,11 @@ pub struct BackupOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub strict: bool,
 
+    /// Metadata-only work admission before content processing.
+    #[cfg_attr(feature = "clap", clap(flatten))]
+    #[serde(flatten)]
+    pub admission: BackupAdmissionOptions,
+
     /// Dry-run mode: Don't write any data or snapshot
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
@@ -240,6 +246,10 @@ where
     <R as ReadSource>::Open: Send,
     <R as ReadSource>::Iter: Send,
 {
+    if opts.admission.enabled() {
+        let inventory = backup_inventory(src, repo.config(), &opts.admission)?;
+        info!("backup admission passed: {inventory:?}");
+    }
     let index = repo.index();
 
     let as_path = opts

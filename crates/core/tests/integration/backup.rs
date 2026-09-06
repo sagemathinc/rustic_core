@@ -108,6 +108,28 @@ fn strict_backup_does_not_publish_incomplete_snapshot(set_up_repo: Result<RepoOp
     Ok(())
 }
 
+#[rstest]
+fn backup_admission_rejects_before_writing_any_pack(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use rustic_core::BackupAdmissionOptions;
+    use std::num::NonZeroU64;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let tmp = tempfile::tempdir()?;
+    std::fs::File::create(tmp.path().join("sparse"))?.set_len(1 << 40)?;
+    let source = PathList::from_iter([tmp.path()]);
+    let opts = BackupOptions::default()
+        .no_scan(true)
+        .strict(true)
+        .admission(BackupAdmissionOptions::default().max_chunk_references(NonZeroU64::new(1)));
+    let before = repo.list::<PackId>()?.collect::<Vec<_>>();
+    assert!(
+        repo.backup(&opts, &source, SnapshotFile::default())
+            .is_err()
+    );
+    assert_eq!(repo.list::<PackId>()?.collect::<Vec<_>>(), before);
+    assert!(repo.get_all_snapshots()?.is_empty());
+    Ok(())
+}
+
 use super::{
     RepoOpen, TestSource, assert_with_win, insta_node_redaction, insta_snapshotfile_redaction,
     set_up_repo, tar_gz_testdata,
