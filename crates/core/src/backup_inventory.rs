@@ -3,6 +3,7 @@
 use std::{
     io,
     num::NonZeroU64,
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ReadSource,
+    backend::node::Node,
     error::{ErrorKind, RusticError, RusticResult},
     repofile::{ConfigFile, configfile::Chunker},
 };
@@ -90,6 +92,26 @@ pub struct BackupInventory {
     pub max_path_depth: u64,
 }
 
+/// Completed inspection of normal backup scope, before a size exclusion filter.
+///
+/// Excluded entries still consume traversal and metadata budgets. Only their
+/// content work is omitted from retained apparent-byte/reference admission.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BackupSelectionInventory {
+    /// Metadata/work bounds for the retained selection.
+    pub retained: BackupInventory,
+    /// All inspected directory entries, including oversized files.
+    pub inspected_entries: u64,
+    /// Metadata bytes for all inspected nodes, including oversized files.
+    pub inspected_node_metadata_bytes: u64,
+    /// Largest inspected path depth, including oversized files.
+    pub inspected_max_path_depth: u64,
+    /// Number of regular-file paths omitted solely by the supplied size limit.
+    pub excluded_files: u64,
+    /// Sum of omitted logical sizes, without hardlink deduplication credits.
+    pub excluded_apparent_bytes: u64,
+}
+
 fn invalid(reason: &'static str) -> Box<RusticError> {
     RusticError::new(
         ErrorKind::InvalidInput,
@@ -160,6 +182,29 @@ pub fn backup_inventory<R: ReadSource>(
     config: &ConfigFile,
     limits: &BackupAdmissionOptions,
 ) -> RusticResult<BackupInventory> {
+    Ok(backup_selection_inventory(source, config, limits, None, |_, _| Ok(()))?.retained)
+}
+
+/// Inspect scope before size filtering and stream every oversized file to a sink.
+///
+/// `source` must apply normal scope filters but MUST NOT already filter by size.
+/// Equality with `exclude_larger_than` remains eligible. The callback receives
+/// metadata only; it must not open file contents and should use a bounded output
+/// sink. A callback failure aborts the scan. Streamed records are provisional
+/// until this function returns successfully; a prefix is never complete evidence.
+/// Immutable-source identity and binding the report to a backup belong to callers.
+///
+/// # Errors
+/// All inventory/admission errors, including unknown metadata, budget exhaustion,
+/// arithmetic overflow and output-sink failures, abort instead of omitting data.
+#[allow(clippy::too_many_lines)]
+pub fn backup_selection_inventory<R: ReadSource>(
+    source: &R,
+    config: &ConfigFile,
+    limits: &BackupAdmissionOptions,
+    exclude_larger_than: Option<NonZeroU64>,
+    mut on_excluded: impl FnMut(&Path, &Node) -> RusticResult<()>,
+) -> RusticResult<BackupSelectionInventory> {
     let started = Instant::now();
     let entries = source
         .inventory_entries()
@@ -172,15 +217,19 @@ pub fn backup_inventory<R: ReadSource>(
     if minimum == 0 {
         return Err(invalid("minimum chunk size must be positive"));
     }
-    let mut result = BackupInventory::default();
+    let mut selection = BackupSelectionInventory::default();
     for entry in entries {
         check_deadline(started, limits.preflight_timeout_seconds)?;
         let entry = entry?;
-        result.entries = add(result.entries, 1)?;
-        check(result.entries, limits.max_entries, "max-entries")?;
+        selection.inspected_entries = add(selection.inspected_entries, 1)?;
+        check(
+            selection.inspected_entries,
+            limits.max_entries,
+            "max-entries",
+        )?;
         let depth = u64::try_from(entry.path.components().count())
             .map_err(|_| invalid("path depth overflow"))?;
-        result.max_path_depth = result.max_path_depth.max(depth);
+        selection.inspected_max_path_depth = selection.inspected_max_path_depth.max(depth);
         check(depth, limits.max_path_depth, "max-path-depth")?;
 
         let node = entry.node;
@@ -188,6 +237,33 @@ pub fn backup_inventory<R: ReadSource>(
         if node.content.is_some() || node.subtree.is_some() {
             return Err(invalid("source inventory contains non-metadata nodes"));
         }
+        let mut counter = MetadataCounter {
+            bytes: 0,
+            remaining: limits
+                .max_metadata_bytes
+                .map_or(u64::MAX, NonZeroU64::get)
+                .saturating_sub(selection.inspected_node_metadata_bytes),
+        };
+        serde_json::to_writer(&mut counter, &node).map_err(|err| {
+            RusticError::with_source(
+                ErrorKind::InvalidInput,
+                "Backup metadata inventory failed or exceeded max-metadata-bytes.",
+                err,
+            )
+        })?;
+        selection.inspected_node_metadata_bytes =
+            add(selection.inspected_node_metadata_bytes, counter.bytes)?;
+        if node.is_file() && exclude_larger_than.is_some_and(|limit| node.meta.size > limit.get()) {
+            selection.excluded_files = add(selection.excluded_files, 1)?;
+            selection.excluded_apparent_bytes =
+                add(selection.excluded_apparent_bytes, node.meta.size)?;
+            on_excluded(&entry.path, &node)?;
+            continue;
+        }
+        let result = &mut selection.retained;
+        result.entries = add(result.entries, 1)?;
+        result.max_path_depth = result.max_path_depth.max(depth);
+        result.node_metadata_bytes = add(result.node_metadata_bytes, counter.bytes)?;
         if node.is_file() {
             check(node.meta.size, limits.max_file_bytes, "max-file-bytes")?;
             result.files = add(result.files, 1)?;
@@ -211,24 +287,9 @@ pub fn backup_inventory<R: ReadSource>(
                 .checked_mul(67)
                 .ok_or_else(|| invalid("content-reference metadata overflow"))?;
         }
-        let mut counter = MetadataCounter {
-            bytes: 0,
-            remaining: limits
-                .max_metadata_bytes
-                .map_or(u64::MAX, NonZeroU64::get)
-                .saturating_sub(result.node_metadata_bytes),
-        };
-        serde_json::to_writer(&mut counter, &node).map_err(|err| {
-            RusticError::with_source(
-                ErrorKind::InvalidInput,
-                "Backup metadata inventory failed or exceeded max-metadata-bytes.",
-                err,
-            )
-        })?;
-        result.node_metadata_bytes = add(result.node_metadata_bytes, counter.bytes)?;
     }
     check_deadline(started, limits.preflight_timeout_seconds)?;
-    Ok(result)
+    Ok(selection)
 }
 
 #[cfg(test)]
@@ -300,6 +361,110 @@ mod tests {
         assert_eq!(report.chunk_references_bound, 2_097_153);
         assert_eq!(report.content_reference_bytes_bound, 2_097_153 * 67);
         assert!(report.node_metadata_bytes > 0);
+    }
+
+    #[test]
+    fn selection_counts_excluded_metadata_without_charging_retained_content() {
+        let source = MetadataSource {
+            sizes: vec![3, 4, 1 << 40],
+            fail: false,
+        };
+        let limits = BackupAdmissionOptions::default()
+            .max_entries(NonZeroU64::new(3))
+            .max_file_bytes(NonZeroU64::new(3))
+            .max_apparent_bytes(NonZeroU64::new(3))
+            .max_chunk_references(NonZeroU64::new(1));
+        let mut excluded = Vec::new();
+        let result = backup_selection_inventory(
+            &source,
+            &ConfigFile::default(),
+            &limits,
+            NonZeroU64::new(3),
+            |path, node| {
+                excluded.push((path.to_owned(), node.meta.size));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.inspected_entries, 3);
+        assert_eq!(result.retained.entries, 1);
+        assert_eq!(result.retained.apparent_bytes, 3);
+        assert_eq!(result.retained.chunk_references_bound, 1);
+        assert_eq!(result.excluded_files, 2);
+        assert_eq!(result.excluded_apparent_bytes, (1 << 40) + 4);
+        assert!(result.inspected_node_metadata_bytes > result.retained.node_metadata_bytes);
+        assert_eq!(
+            excluded,
+            vec![(PathBuf::from("1"), 4), (PathBuf::from("2"), 1 << 40)]
+        );
+        for limits in [
+            limits.clone().max_entries(NonZeroU64::new(2)),
+            limits.max_metadata_bytes(NonZeroU64::new(result.inspected_node_metadata_bytes - 1)),
+        ] {
+            assert!(
+                backup_selection_inventory(
+                    &source,
+                    &ConfigFile::default(),
+                    &limits,
+                    NonZeroU64::new(3),
+                    |_, _| Ok(())
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn selection_sink_and_scan_failures_never_complete_a_partial_inventory() {
+        let config = ConfigFile::default();
+        let limits = BackupAdmissionOptions::default();
+        for source in [
+            MetadataSource {
+                sizes: vec![4],
+                fail: true,
+            },
+            MetadataSource {
+                sizes: vec![u64::MAX, 4],
+                fail: false,
+            },
+        ] {
+            assert!(
+                backup_selection_inventory(
+                    &source,
+                    &config,
+                    &limits,
+                    NonZeroU64::new(3),
+                    |_, _| Ok(())
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            backup_selection_inventory(
+                &MetadataSource {
+                    sizes: vec![4],
+                    fail: false
+                },
+                &config,
+                &limits,
+                NonZeroU64::new(3),
+                |_, _| Err(invalid("report storage failed"))
+            )
+            .is_err()
+        );
+        let result = backup_selection_inventory(
+            &MetadataSource {
+                sizes: vec![4],
+                fail: false,
+            },
+            &config,
+            &limits,
+            NonZeroU64::new(3),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result.retained, BackupInventory::default());
+        assert_eq!(result.excluded_files, 1);
     }
 
     #[test]

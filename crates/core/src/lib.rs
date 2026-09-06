@@ -146,7 +146,10 @@ pub use crate::{
         source_reader::SourceReader,
         stdin::StdinSource,
     },
-    backup_inventory::{BackupAdmissionOptions, BackupInventory, backup_inventory},
+    backup_inventory::{
+        BackupAdmissionOptions, BackupInventory, BackupSelectionInventory, backup_inventory,
+        backup_selection_inventory,
+    },
     blob::{
         BlobId, DataId, PackedId,
         tree::{
