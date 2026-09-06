@@ -16,7 +16,7 @@ use crate::{
     backend::{
         FileType, ReadBackend,
         decrypt::DecryptReadBackend,
-        local_destination::LocalDestination,
+        local_destination::{LocalDestination, LocalDestinationResult},
         node::{Node, NodeType},
     },
     blob::{BlobLocation, BlobLocations},
@@ -59,6 +59,10 @@ pub struct RestoreOptions {
     /// Always read and verify existing files (don't trust correct modification time and file size)
     #[cfg_attr(feature = "clap", clap(long))]
     pub verify_existing: bool,
+
+    /// Fail on destination traversal, removal, or metadata errors instead of logging warnings.
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub strict: bool,
 
     /// Restore sparse files
     #[cfg_attr(feature = "clap", clap(long))]
@@ -186,21 +190,28 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     let mut restore_infos = RestorePlan::default();
     let mut additional_existing = false;
 
-    let next_entry = |walker: &mut walkdir::IntoIter| -> Option<DirEntry> {
-        walker
-            .inspect(|r| {
-                if let Err(err) = r {
-                    error!("Error during collection of files: {err:?}");
+    let next_entry = |walker: &mut walkdir::IntoIter| -> RusticResult<Option<DirEntry>> {
+        for entry in walker {
+            match entry {
+                Ok(entry) => return Ok(Some(entry)),
+                Err(err) if opts.strict => {
+                    return Err(RusticError::with_source(
+                        ErrorKind::InputOutput,
+                        "Strict restore failed to inspect destination.",
+                        err,
+                    ));
                 }
-            })
-            .find_map(Result::ok)
+                Err(err) => error!("Error during collection of files: {err:?}"),
+            }
+        }
+        Ok(None)
     };
 
     let mut process_existing =
         |walker: &mut walkdir::IntoIter, entry: &DirEntry| -> RusticResult<Option<DirEntry>> {
             if entry.depth() == 0 {
                 // don't process the root dir which should be existing
-                return Ok(next_entry(walker));
+                return next_entry(walker);
             }
 
             debug!("additional {}", entry.path().display());
@@ -224,14 +235,20 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     );
                 }
                 (true, false, true) => {
-                    if let Err(err) = dest.remove_dir(entry.path()) {
-                        error!("error removing {}: {err}", entry.path().display());
-                    }
+                    check_restore_metadata(
+                        opts.strict,
+                        entry.path(),
+                        "remove directory",
+                        dest.remove_dir(entry.path()),
+                    )?;
                 }
                 (true, false, false) => {
-                    if let Err(err) = dest.remove_file(entry.path()) {
-                        error!("error removing {}: {err}", entry.path().display());
-                    }
+                    check_restore_metadata(
+                        opts.strict,
+                        entry.path(),
+                        "remove file",
+                        dest.remove_file(entry.path()),
+                    )?;
                 }
                 (false, _, _) => {
                     additional_existing = true;
@@ -242,7 +259,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
             if is_dir {
                 walker.skip_current_dir();
             }
-            Ok(next_entry(walker))
+            next_entry(walker)
         };
 
     let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> RusticResult<_> {
@@ -314,7 +331,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         .sort_by_file_name()
         .into_iter();
 
-    let mut next_dst = next_entry(&mut walker);
+    let mut next_dst = next_entry(&mut walker)?;
 
     let mut next_node = node_streamer.next().transpose()?;
 
@@ -339,7 +356,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                             // if types do not match, first remove the existing file
                             next_dst = process_existing(&mut walker, destination)?;
                         } else {
-                            next_dst = next_entry(&mut walker);
+                            next_dst = next_entry(&mut walker)?;
                         }
                         process_node(path, node, true)?;
                         next_node = node_streamer.next().transpose()?;
@@ -415,18 +432,18 @@ fn restore_metadata(
                         break;
                     }
                     let (path, node) = dir_stack.pop().unwrap();
-                    set_metadata(dest, opts, &path, &node);
+                    set_metadata(dest, opts, &path, &node)?;
                 }
                 // push current path to the stack
                 dir_stack.push((path, node));
             }
-            _ => set_metadata(dest, opts, &path, &node),
+            _ => set_metadata(dest, opts, &path, &node)?,
         }
     }
 
     // empty dir stack and set metadata
     for (path, node) in dir_stack.into_iter().rev() {
-        set_metadata(dest, opts, &path, &node);
+        set_metadata(dest, opts, &path, &node)?;
     }
 
     Ok(())
@@ -455,36 +472,48 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 /// # Errors
 ///
 /// If the metadata could not be set.
-// TODO: Return a result here, introduce errors and get rid of logging.
 pub(crate) fn set_metadata(
     dest: &LocalDestination,
     opts: RestoreOptions,
     path: &PathBuf,
     node: &Node,
-) {
+) -> RusticResult<()> {
     debug!("setting metadata for {}", path.display());
-    dest.create_special(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
+    let check = |action, result| check_restore_metadata(opts.strict, path, action, result);
+    check("create special file", dest.create_special(path, node))?;
     match (opts.no_ownership, opts.numeric_id) {
         (true, _) => {}
-        (false, true) => dest
-            .set_uid_gid(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting UID/GID failed.", path.display())),
-        (false, false) => dest
-            .set_user_group(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
+        (false, true) => check("set UID/GID", dest.set_uid_gid(path, &node.meta))?,
+        (false, false) => check("set user/group", dest.set_user_group(path, &node.meta))?,
     }
-    dest.set_permission(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
-    dest.set_extended_attributes(path, &node.meta.extended_attributes)
-        .unwrap_or_else(|_| {
-            warn!(
-                "restore {}: setting extended attributes failed.",
-                path.display()
-            );
-        });
-    dest.set_times(path, &node.meta)
-        .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
+    check("set permissions", dest.set_permission(path, node))?;
+    check(
+        "set extended attributes",
+        dest.set_extended_attributes(path, &node.meta.extended_attributes),
+    )?;
+    check("set file times", dest.set_times(path, &node.meta))?;
+    Ok(())
+}
+
+fn check_restore_metadata(
+    strict: bool,
+    path: &std::path::Path,
+    action: &str,
+    result: LocalDestinationResult<()>,
+) -> RusticResult<()> {
+    if let Err(err) = result {
+        if strict {
+            return Err(RusticError::with_source(
+                ErrorKind::InputOutput,
+                "Strict restore failed to {action} for `{path}`.",
+                err,
+            )
+            .attach_context("action", action)
+            .attach_context("path", path.display().to_string()));
+        }
+        warn!("restore {}: {action} failed: {err}", path.display());
+    }
+    Ok(())
 }
 
 struct PackInfo {

@@ -14,6 +14,100 @@ use rustic_core::{
     repofile::{PackId, SnapshotFile},
 };
 
+struct FaultSource {
+    fail_open: bool,
+}
+
+struct FaultOpen(bool);
+
+impl rustic_core::ReadSourceOpen for FaultOpen {
+    type Reader = std::io::Cursor<Vec<u8>>;
+    fn open(self) -> rustic_core::RusticResult<Self::Reader> {
+        if self.0 {
+            Err(rustic_core::RusticError::new(
+                rustic_core::ErrorKind::InputOutput,
+                "injected source-open failure",
+            ))
+        } else {
+            Ok(std::io::Cursor::new(vec![7; 8192]))
+        }
+    }
+}
+
+impl rustic_core::ReadSource for FaultSource {
+    type Open = FaultOpen;
+    type Iter =
+        std::vec::IntoIter<rustic_core::RusticResult<rustic_core::ReadSourceEntry<FaultOpen>>>;
+
+    fn size(&self) -> rustic_core::RusticResult<Option<u64>> {
+        Ok(None)
+    }
+
+    fn entries(&self) -> Self::Iter {
+        use rustic_core::{
+            ReadSourceEntry,
+            repofile::{Metadata, Node, NodeType},
+        };
+        let mut entries = vec![Ok(ReadSourceEntry {
+            path: PathBuf::from("test/file"),
+            node: Node::new_node(
+                "file".as_ref(),
+                NodeType::File,
+                Metadata {
+                    size: 8192,
+                    ..Metadata::default()
+                },
+            ),
+            open: Some(FaultOpen(false)),
+        })];
+        if self.fail_open {
+            entries.push(Ok(ReadSourceEntry {
+                path: PathBuf::from("test/unreadable"),
+                node: Node::new_node(
+                    "unreadable".as_ref(),
+                    NodeType::File,
+                    Metadata {
+                        size: 8192,
+                        ..Metadata::default()
+                    },
+                ),
+                open: Some(FaultOpen(true)),
+            }));
+        } else {
+            entries.push(Err(rustic_core::RusticError::new(
+                rustic_core::ErrorKind::InputOutput,
+                "injected traversal failure",
+            )));
+        }
+        entries.into_iter()
+    }
+}
+
+#[rstest]
+fn strict_backup_does_not_publish_incomplete_snapshot(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    for fail_open in [false, true] {
+        let before = repo.get_all_snapshots()?.len();
+        let result = repo.archive(
+            &BackupOptions::default().strict(true).no_scan(true),
+            &FaultSource { fail_open },
+            SnapshotFile::default(),
+            &[PathBuf::from("test")],
+        );
+        assert!(result.is_err());
+        assert_eq!(repo.get_all_snapshots()?.len(), before);
+        // Compatibility mode remains explicitly best effort.
+        let _snapshot = repo.archive(
+            &BackupOptions::default().no_scan(true),
+            &FaultSource { fail_open },
+            SnapshotFile::default(),
+            &[PathBuf::from("test")],
+        )?;
+        assert_eq!(repo.get_all_snapshots()?.len(), before + 1);
+    }
+    Ok(())
+}
+
 use super::{
     RepoOpen, TestSource, assert_with_win, insta_node_redaction, insta_snapshotfile_redaction,
     set_up_repo, tar_gz_testdata,

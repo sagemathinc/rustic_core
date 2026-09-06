@@ -87,6 +87,7 @@ fn sparse_restore_roundtrip_and_overwrite(set_up_repo: Result<RepoOpen>) -> Resu
     let repo = repo.to_indexed()?;
     let node = repo.node_from_snapshot_path("latest", |_| true)?;
     let opts = RestoreOptions::default()
+        .strict(true)
         .sparse(SparseRestore::ByContentRequired)
         .verify_existing(true)
         .no_ownership(true);
@@ -150,5 +151,42 @@ fn restore_write_failure_returns_error(set_up_repo: Result<RepoOpen>) -> Result<
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
     fs::create_dir_all(restore_dir.path().join("test/file"))?;
     assert!(repo.restore(plan, &opts, ls, &dest).is_err());
+    Ok(())
+}
+
+#[rstest]
+#[cfg(target_os = "linux")]
+fn strict_restore_reports_metadata_failure(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = TestSource::new(tempdir()?);
+    fs::write(source.path().join("file"), [7; 8192])?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let _snapshot = repo.backup(
+        &BackupOptions::default()
+            .as_path(PathBuf::from("test"))
+            .strict(true),
+        &source.path_list(),
+        SnapshotFile::default(),
+    )?;
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    for strict in [false, true] {
+        let restore_dir = tempdir()?;
+        let dest = LocalDestination::new(restore_dir.path().to_str().unwrap(), true, false)?;
+        let opts = RestoreOptions::default().strict(strict).no_ownership(true);
+        let ls = repo.ls(&node, &LsOptions::default())?;
+        let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+        let modified = ls.map(|item| {
+            item.map(|(path, mut node)| {
+                if node.is_file() {
+                    node.meta.extended_attributes = serde_json::from_value(serde_json::json!([
+                        {"name": "invalid-xattr-namespace", "value": "AQ=="}
+                    ]))
+                    .unwrap();
+                }
+                (path, node)
+            })
+        });
+        assert_eq!(repo.restore(plan, &opts, modified, &dest).is_err(), strict);
+    }
     Ok(())
 }

@@ -142,6 +142,7 @@ pub use crate::{
                 BlockdevOption, DevIdOption, NodeModification, TimeOption, XattrOption,
             },
         },
+        source_reader::SourceReader,
         stdin::StdinSource,
     },
     blob::{

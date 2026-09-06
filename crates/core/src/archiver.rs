@@ -4,6 +4,7 @@ pub(crate) mod tree;
 pub(crate) mod tree_archiver;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::scope;
 
 use jiff::Zoned;
@@ -18,7 +19,7 @@ use crate::{
     },
     backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
     blob::BlobType,
-    error::RusticResult,
+    error::{ErrorKind, RusticError, RusticResult},
     index::{
         ReadGlobalIndex,
         indexer::{Indexer, SharedIndexer},
@@ -60,6 +61,9 @@ pub struct Archiver<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> {
 
     /// The `SnapshotFile` to write to.
     snap: SnapshotFile,
+
+    /// Do not publish a successful snapshot if any source item was lost to errors.
+    strict: bool,
 }
 
 impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
@@ -99,7 +103,15 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             be,
             index,
             snap,
+            strict: false,
         })
+    }
+
+    /// Reject snapshots with source or processing errors instead of publishing partial data.
+    #[must_use]
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Archives the given source.
@@ -138,6 +150,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         <R as ReadSource>::Open: Send,
         <R as ReadSource>::Iter: Send,
     {
+        let incomplete = AtomicBool::new(false);
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
             let src_size_handle = s.spawn(|| {
@@ -145,7 +158,10 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                     match src.size() {
                         Ok(Some(size)) => p.set_length(size),
                         Ok(None) => {}
-                        Err(err) => warn!("error determining backup size: {}", err.display_log()),
+                        Err(err) => {
+                            incomplete.store(true, Ordering::Relaxed);
+                            warn!("error determining backup size: {}", err.display_log());
+                        }
                     }
                 }
             });
@@ -153,6 +169,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             // filter out errors and handle as_path
             let iter = src.entries().filter_map(|item| match item {
                 Err(err) => {
+                    incomplete.store(true, Ordering::Relaxed);
                     warn!("ignoring error: {}", err.display_log());
                     None
                 }
@@ -186,6 +203,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 |item| match self.parent.process(&self.be, self.index, item) {
                     Ok(item) => Some(item),
                     Err(err) => {
+                        incomplete.store(true, Ordering::Relaxed);
                         warn!("ignoring error reading parent snapshot: {err:?}");
                         None
                     }
@@ -197,6 +215,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             .filter_map(|item| match item {
                 Ok(item) => Some(item),
                 Err(err) => {
+                    incomplete.store(true, Ordering::Relaxed);
                     warn!("ignoring error: {}", err.display_log());
                     None
                 }
@@ -216,6 +235,16 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         self.snap.tree = id;
 
         self.indexer.write().unwrap().finalize()?;
+
+        // Join and finalize the data workers before failing, but never publish a
+        // snapshot that a caller could mistake for a complete backup.
+        if self.strict && incomplete.load(Ordering::Relaxed) {
+            p.finish();
+            return Err(RusticError::new(
+                ErrorKind::InputOutput,
+                "Strict backup failed because source inspection or file processing was incomplete. No snapshot was saved.",
+            ));
+        }
 
         summary.finalize(&self.snap.time);
         self.snap.summary = Some(summary);

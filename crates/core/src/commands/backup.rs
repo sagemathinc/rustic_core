@@ -171,6 +171,11 @@ pub struct BackupOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub no_scan: bool,
 
+    /// Fail without saving a snapshot if source inspection or file processing has errors.
+    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub strict: bool,
+
     /// Dry-run mode: Don't write any data or snapshot
     #[cfg_attr(feature = "clap", clap(long))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
@@ -284,7 +289,7 @@ where
 
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
     info!("starting to backup {backup_paths:?} ...");
-    let archiver = Archiver::new(be, index, repo.config(), parent, snap)?;
+    let archiver = Archiver::new(be, index, repo.config(), parent, snap)?.strict(opts.strict);
     let p = repo.progress_bytes("backing up...");
 
     archiver.archive(
