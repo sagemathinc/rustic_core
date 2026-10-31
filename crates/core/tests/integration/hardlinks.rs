@@ -292,9 +292,32 @@ fn noise(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// The chunker's largest chunk (`DEFAULT_CHUNK_MAX_SIZE`).  Chunk boundaries
-/// depend on the repository's random polynomial, so only this bound is fixed.
-const MAX_CHUNK: usize = 8 * 1024 * 1024;
+/// The largest chunk in [`small_chunk_repo`].  Chunk boundaries depend on the
+/// repository's random polynomial, so only this bound is fixed.
+const MAX_CHUNK: usize = 128 * 1024;
+
+/// A repository whose Rabin chunks are small (64 KiB average, 32 KiB minimum,
+/// 128 KiB maximum), so a file of a few maximal chunks stays cheap, also
+/// under coverage instrumentation.
+fn small_chunk_repo() -> Result<RepoOpen> {
+    use rustic_core::{
+        ConfigOptions, Credentials, KeyOptions, RepositoryBackends, RepositoryOptions,
+        repofile::MasterKey,
+    };
+    use rustic_testing::backend::in_memory_backend::InMemoryBackend;
+
+    let be = RepositoryBackends::new(Arc::new(InMemoryBackend::new()), None);
+    let repo = Repository::new(&RepositoryOptions::default(), &be)?;
+    let config = ConfigOptions::default()
+        .set_chunk_size(bytesize::ByteSize::kib(64))
+        .set_chunk_min_size(bytesize::ByteSize::kib(32))
+        .set_chunk_max_size(bytesize::ByteSize::kib(128));
+    Ok(repo.init(
+        &Credentials::Masterkey(MasterKey::new()),
+        &KeyOptions::default(),
+        &config,
+    )?)
+}
 
 /// Three paths of one inode; whichever path owns the read fails (slowly, so
 /// the other two are waiting), either at open or partway through reading.  At
@@ -304,10 +327,7 @@ const MAX_CHUNK: usize = 8 * 1024 * 1024;
 #[rstest]
 #[case::at_open(None)]
 #[case::mid_read(Some((5 * MAX_CHUNK / 2) as u64))]
-fn owner_read_failure_gives_waiters_their_own_read(
-    set_up_repo: Result<RepoOpen>,
-    #[case] fail_after: Option<u64>,
-) -> Result<()> {
+fn owner_read_failure_gives_waiters_their_own_read(#[case] fail_after: Option<u64>) -> Result<()> {
     let bytes = noise(3 * MAX_CHUNK + 17);
     let mut source = Source::new(vec![
         path("a", 5, 3, &bytes).slow(),
@@ -317,7 +337,7 @@ fn owner_read_failure_gives_waiters_their_own_read(
     source.fail_first = vec![(1, 5)];
     source.fail_after = fail_after;
     let (repo, run) = archive(
-        set_up_repo?.to_indexed_ids()?,
+        small_chunk_repo()?.to_indexed_ids()?,
         &source,
         true,
         None,
