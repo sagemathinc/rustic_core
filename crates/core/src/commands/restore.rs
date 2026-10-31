@@ -363,16 +363,17 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                     }
                     Ordering::Equal => {
                         // process existing node
-                        if (node.is_dir() && !destination.file_type().is_dir())
+                        let mismatch = (node.is_dir() && !destination.file_type().is_dir())
                             || (node.is_file() && !destination.file_type().is_file())
-                            || node.is_special()
-                        {
+                            || node.is_special();
+                        if mismatch {
                             // if types do not match, first remove the existing file
                             next_dst = process_existing(&mut walker, destination)?;
                         } else {
                             next_dst = next_entry(&mut walker)?;
                         }
-                        process_node(path, node, true)?;
+                        // with --delete the mismatching entry is gone, so it must be created anew
+                        process_node(path, node, !(mismatch && opts.delete))?;
                         next_node = node_streamer.next().transpose()?;
                     }
                     Ordering::Greater => {
