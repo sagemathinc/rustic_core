@@ -35,7 +35,7 @@ struct Path {
     device: u64,
     inode: u64,
     links: u64,
-    mtime: i64,
+    mtime: Option<i64>,
     ctime: Option<i64>,
     bytes: Vec<u8>,
     /// Sleep this long in open, so other paths reach the archiver meanwhile.
@@ -48,7 +48,7 @@ fn path(name: &'static str, inode: u64, links: u64, bytes: &[u8]) -> Path {
         device: 1,
         inode,
         links,
-        mtime: 1_600_000_000,
+        mtime: Some(1_600_000_000),
         ctime: Some(1_600_000_000),
         bytes: bytes.to_vec(),
         delay_ms: 0,
@@ -140,7 +140,7 @@ impl ReadSource for Source {
                             links: p.links,
                             inode: p.inode,
                             device_id: p.device,
-                            mtime: Some(jiff::Timestamp::from_second(p.mtime).unwrap()),
+                            mtime: p.mtime.map(|t| jiff::Timestamp::from_second(t).unwrap()),
                             ctime: p.ctime.map(|t| jiff::Timestamp::from_second(t).unwrap()),
                             ..Metadata::default()
                         },
@@ -393,6 +393,37 @@ fn a_parent_group_split_or_merged(set_up_repo: Result<RepoOpen>) -> Result<()> {
     )?;
     assert_ne!(id_of(&runs[1], "c"), id_of(&runs[1], "a"));
     assert_eq!(id_of(&runs[1], "y"), id_of(&runs[1], "x"));
+    Ok(())
+}
+
+/// Within one run, two paths of the same inode number whose stat differs in
+/// one guarded way, with different bytes: the cache must not let the second
+/// reuse the first, so both are read.  Each case fails if its guard in the
+/// hard-link cache (state equality, or admission) is removed.
+#[rstest]
+#[case::size_differs(|_: &mut Path| (), |b: &mut Path| b.bytes.push(b'!'))]
+#[case::mtime_differs(|_: &mut Path| (), |b: &mut Path| b.mtime = Some(T1))]
+#[case::ctime_differs(|_: &mut Path| (), |b: &mut Path| b.ctime = Some(T1))]
+#[case::inode_zero(|a: &mut Path| a.inode = 0, |b: &mut Path| b.inode = 0)]
+#[case::single_link(|a: &mut Path| a.links = 1, |b: &mut Path| b.links = 1)]
+#[case::no_mtime(|a: &mut Path| a.mtime = None, |b: &mut Path| b.mtime = None)]
+#[case::no_ctime(|a: &mut Path| a.ctime = None, |b: &mut Path| b.ctime = None)]
+fn the_cache_admits_and_matches_only_identical_hard_links(
+    set_up_repo: Result<RepoOpen>,
+    #[case] change_a: fn(&mut Path),
+    #[case] change_b: fn(&mut Path),
+) -> Result<()> {
+    let mut a = path("a", 5, 2, b"bytes of a");
+    let mut b = path("b", 5, 2, b"bytes of b");
+    change_a(&mut a);
+    change_b(&mut b);
+    let runs = differential(
+        set_up_repo?,
+        &[Source::new(vec![a, b])],
+        &ParentOptions::default(),
+    )?;
+    assert_ne!(id_of(&runs[0], "a"), id_of(&runs[0], "b"));
+    assert_eq!(runs[0].opens, 2);
     Ok(())
 }
 
