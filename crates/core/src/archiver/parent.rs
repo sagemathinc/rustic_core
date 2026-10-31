@@ -32,6 +32,9 @@ pub struct Parent {
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
     ignore_inode: bool,
+    /// Whether the last file processed matched a parent node that also has
+    /// its device, inode number and ctime (see [`Parent::vouches_for_inode`]).
+    last_match_vouches_for_inode: bool,
 }
 
 /// The result of a parent search.
@@ -113,7 +116,35 @@ impl Parent {
             stack: Vec::new(),
             ignore_ctime,
             ignore_inode,
+            last_match_vouches_for_inode: false,
         }
+    }
+
+    /// Whether a matched parent node proves the content of the inode itself,
+    /// not only of this path: the device, the inode number and the ctime were
+    /// all present on both sides, compared and equal. A match that ignored
+    /// ctime or inode (by option, or because one side lacks them) only vouches
+    /// for this path.
+    fn vouches_for_inode(
+        ignore_ctime: bool,
+        ignore_inode: bool,
+        p_node: &Node,
+        node: &Node,
+    ) -> bool {
+        let (p_meta, meta) = (&p_node.meta, &node.meta);
+        !ignore_ctime
+            && !ignore_inode
+            && p_meta.inode != 0
+            && p_meta.inode == meta.inode
+            && p_meta.device_id == meta.device_id
+            && p_meta.ctime.is_some()
+            && p_meta.ctime == meta.ctime
+    }
+
+    /// Whether the last file passed to [`Parent::process`] matched its parent
+    /// node strongly enough to vouch for every path of its inode.
+    pub(crate) const fn last_match_vouches_for_inode(&self) -> bool {
+        self.last_match_vouches_for_inode
     }
 
     /// Returns the parent node with the given name.
@@ -288,10 +319,14 @@ impl Parent {
                 TreeType::EndTree
             }
             TreeType::Other((path, mut node, open)) => {
+                let (ignore_ctime, ignore_inode) = (self.ignore_ctime, self.ignore_inode);
+                let mut vouches = false;
                 let parent = self.is_parent(&node, &node.name());
                 let parent = match parent {
                     ParentResult::Matched(p_node) => {
                         if p_node.content.iter().flatten().all(|id| index.has_data(id)) {
+                            vouches =
+                                Self::vouches_for_inode(ignore_ctime, ignore_inode, p_node, &node);
                             node.content.clone_from(&p_node.content);
                             ParentResult::Matched(())
                         } else {
@@ -304,6 +339,7 @@ impl Parent {
                     }
                     parent_result => parent_result.map(|_| ()),
                 };
+                self.last_match_vouches_for_inode = vouches;
                 TreeType::Other((path, node, (open, parent)))
             }
         };

@@ -228,11 +228,15 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 |item| match self.parent.process(&self.be, self.index, item) {
                     Ok(item) => {
                         // Seed the hard-link cache here, in order, before any
-                        // later path of the same inode reaches a worker.
+                        // later path of the same inode reaches a worker. Only
+                        // a match that compared device, inode and ctime vouches
+                        // for the inode's other paths; a weaker one (e.g. with
+                        // --ignore-ctime) vouches for this path only.
                         if let (
                             Some(cache),
                             TreeType::Other((_, node, (_, ParentResult::Matched(())))),
                         ) = (&hardlinks, &item)
+                            && self.parent.last_match_vouches_for_inode()
                         {
                             cache.seed(node);
                         }
