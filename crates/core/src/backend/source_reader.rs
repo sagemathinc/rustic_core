@@ -80,11 +80,7 @@ impl<R: Read> SourceReader<R> {
                 }
                 Err(err) => return Err(io::Error::from_raw_os_error(err as i32)),
             };
-            let position = if is_hole {
-                end_offset
-            } else {
-                *offset
-            };
+            let position = if is_hole { end_offset } else { *offset };
             _ = file.seek(io::SeekFrom::Start(position))?;
             *offset = position;
             return Ok(is_hole);
