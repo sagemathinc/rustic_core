@@ -316,7 +316,7 @@ mod tests {
             panic!("inventory must not use the sorted backup walker");
         }
         fn inventory_entries(&self) -> Option<Self::Iter> {
-            let mut entries = self
+            let entries = self
                 .sizes
                 .iter()
                 .enumerate()
@@ -335,10 +335,8 @@ mod tests {
                         open: None,
                     })
                 })
+                .chain(self.fail.then(|| Err(invalid("injected metadata error"))))
                 .collect::<Vec<_>>();
-            if self.fail {
-                entries.push(Err(invalid("injected metadata error")));
-            }
             Some(entries.into_iter())
         }
     }

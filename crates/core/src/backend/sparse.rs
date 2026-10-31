@@ -180,7 +180,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(contents(&mut file).is_empty());
+        assert_eq!(contents(&mut file), Vec::<u8>::new());
     }
 
     #[test]

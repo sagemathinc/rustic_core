@@ -57,7 +57,7 @@ fn strict_backup_selects_metadata_errors_without_an_admission_scan(
         )
         .is_err()
     );
-    assert!(repo.get_all_snapshots()?.is_empty());
+    assert_eq!(repo.get_all_snapshots()?, Vec::new());
     let _snapshot = repo.archive(
         &BackupOptions::default().no_scan(true),
         &MetadataFaultSource,
@@ -157,6 +157,9 @@ fn strict_backup_does_not_publish_incomplete_snapshot(set_up_repo: Result<RepoOp
 }
 
 #[rstest]
+// The 1 TiB fixture relies on `set_len` creating a sparse file; NTFS
+// allocates it for real and the runner runs out of disk.
+#[cfg_attr(windows, ignore = "needs a sparse 1 TiB file")]
 fn backup_admission_rejects_before_writing_any_pack(set_up_repo: Result<RepoOpen>) -> Result<()> {
     use rustic_core::BackupAdmissionOptions;
     use std::num::NonZeroU64;
@@ -174,7 +177,7 @@ fn backup_admission_rejects_before_writing_any_pack(set_up_repo: Result<RepoOpen
             .is_err()
     );
     assert_eq!(repo.list::<PackId>()?.collect::<Vec<_>>(), before);
-    assert!(repo.get_all_snapshots()?.is_empty());
+    assert_eq!(repo.get_all_snapshots()?, Vec::new());
     Ok(())
 }
 

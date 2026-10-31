@@ -166,11 +166,15 @@ mod tests {
         assert!(reader.skip_hole(65536 - 4096).unwrap());
         assert!(!reader.skip_hole(1).unwrap());
         assert!(!reader.skip_hole(0).unwrap());
-        let mut file = tempfile::tempfile().unwrap();
-        _ = file
-            .seek(SeekFrom::Start(i64::MAX.cast_unsigned()))
-            .unwrap();
-        let mut reader = SourceReader::<File>::file(file).unwrap();
+        // Not every filesystem can seek this far (ext4 returns EINVAL), so
+        // place the offset directly instead of seeking the file there.
+        let mut reader = SourceReader::<File> {
+            inner: Source::File {
+                file: tempfile::tempfile().unwrap(),
+                offset: i64::MAX.cast_unsigned(),
+                holes: true,
+            },
+        };
         assert_eq!(
             reader.skip_hole(1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput,

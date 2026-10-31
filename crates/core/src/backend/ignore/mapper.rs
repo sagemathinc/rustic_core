@@ -197,28 +197,25 @@ mod strict_metadata_tests {
     #[test]
     fn strict_metadata_does_not_substitute_empty_xattrs_on_read_failure() {
         assert!(read_xattrs(XattrOption::Yes, true, denied).is_err());
-        assert!(
-            read_xattrs(XattrOption::Yes, false, denied)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            read_xattrs(XattrOption::Yes, false, denied).unwrap(),
+            Vec::new()
         );
     }
 
     #[test]
     fn intentional_scope_exclusion_does_not_read_attributes() {
-        assert!(
-            read_xattrs(XattrOption::No, true, || panic!("must not read"))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            read_xattrs(XattrOption::No, true, || panic!("must not read")).unwrap(),
+            Vec::new()
         );
     }
 
     #[test]
     fn strict_metadata_preserves_empty_and_nonempty_attributes() {
-        assert!(
-            read_xattrs(XattrOption::Yes, true, || Ok(Vec::new()))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            read_xattrs(XattrOption::Yes, true, || Ok(Vec::new())).unwrap(),
+            Vec::new()
         );
         let attributes = vec![ExtendedAttribute {
             name: "user.test".into(),
