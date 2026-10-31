@@ -76,6 +76,9 @@ impl Path {
 struct Source {
     paths: Vec<Path>,
     fail_first: Vec<(u64, u64)>,
+    /// If set, that first open succeeds and its reader fails after this many
+    /// bytes instead.
+    fail_after: Option<u64>,
     failed: Arc<Mutex<HashSet<(u64, u64)>>>,
     opens: Arc<AtomicUsize>,
 }
@@ -86,6 +89,7 @@ impl Source {
         Self {
             paths,
             fail_first: Vec::new(),
+            fail_after: None,
             failed: Arc::default(),
             opens: Arc::default(),
         }
@@ -96,24 +100,49 @@ struct Open {
     path: Path,
     /// The first open of this inode (whichever path it is) fails.
     fail_first: Option<(u64, u64)>,
+    fail_after: Option<u64>,
     failed: Arc<Mutex<HashSet<(u64, u64)>>>,
     opens: Arc<AtomicUsize>,
 }
 
+/// The bytes of a path, failing with an I/O error after `fail_after` bytes.
+struct Reader {
+    bytes: std::io::Cursor<Vec<u8>>,
+    fail_after: Option<u64>,
+}
+
+impl std::io::Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(limit) = self.fail_after else {
+            return self.bytes.read(buf);
+        };
+        let left = limit.saturating_sub(self.bytes.position());
+        if left == 0 {
+            return Err(std::io::Error::other("injected read failure"));
+        }
+        let n = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        self.bytes.read(&mut buf[..n])
+    }
+}
+
 impl ReadSourceOpen for Open {
-    type Reader = std::io::Cursor<Vec<u8>>;
+    type Reader = Reader;
     fn open(self) -> RusticResult<Self::Reader> {
         _ = self.opens.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(self.path.delay_ms));
-        if let Some(key) = self.fail_first
-            && self.failed.lock().unwrap().insert(key)
-        {
+        let first = self
+            .fail_first
+            .is_some_and(|key| self.failed.lock().unwrap().insert(key));
+        if first && self.fail_after.is_none() {
             return Err(rustic_core::RusticError::new(
                 rustic_core::ErrorKind::InputOutput,
                 "injected open failure",
             ));
         }
-        Ok(std::io::Cursor::new(self.path.bytes))
+        Ok(Reader {
+            bytes: std::io::Cursor::new(self.path.bytes),
+            fail_after: if first { self.fail_after } else { None },
+        })
     }
 }
 
@@ -148,6 +177,7 @@ impl ReadSource for Source {
                     open: Some(Open {
                         path: p.clone(),
                         fail_first: self.fail_first.contains(&key).then_some(key),
+                        fail_after: self.fail_after,
                         failed: self.failed.clone(),
                         opens: self.opens.clone(),
                     }),
@@ -251,18 +281,63 @@ fn id_of(run: &Run, name: &str) -> Vec<rustic_core::DataId> {
         .unwrap_or_else(|| panic!("{name} is not in the snapshot: {:?}", run.contents.keys()))
 }
 
+/// Bytes that the chunker cuts into several blobs (no long runs).
+fn noise(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (x >> 56) as u8
+        })
+        .collect()
+}
+
+/// The largest chunk in [`small_chunk_repo`].  Chunk boundaries depend on the
+/// repository's random polynomial, so only this bound is fixed.
+const MAX_CHUNK: usize = 128 * 1024;
+
+/// A repository whose Rabin chunks are small (64 KiB average, 32 KiB minimum,
+/// 128 KiB maximum), so a file of a few maximal chunks stays cheap, also
+/// under coverage instrumentation.
+fn small_chunk_repo() -> Result<RepoOpen> {
+    use rustic_core::{
+        ConfigOptions, Credentials, KeyOptions, RepositoryBackends, RepositoryOptions,
+        repofile::MasterKey,
+    };
+    use rustic_testing::backend::in_memory_backend::InMemoryBackend;
+
+    let be = RepositoryBackends::new(Arc::new(InMemoryBackend::new()), None);
+    let repo = Repository::new(&RepositoryOptions::default(), &be)?;
+    let config = ConfigOptions::default()
+        .set_chunk_size(bytesize::ByteSize::kib(64))
+        .set_chunk_min_size(bytesize::ByteSize::kib(32))
+        .set_chunk_max_size(bytesize::ByteSize::kib(128));
+    Ok(repo.init(
+        &Credentials::Masterkey(MasterKey::new()),
+        &KeyOptions::default(),
+        &config,
+    )?)
+}
+
+/// Three paths of one inode; whichever path owns the read fails (slowly, so
+/// the other two are waiting), either at open or partway through reading.  At
+/// 2.5 chunk maxima in, at least two blobs are already written whatever the
+/// polynomial.  The waiters must read the file themselves and get all of it;
+/// nothing partial may be published.
 #[rstest]
-fn owner_read_failure_gives_waiters_their_own_read(set_up_repo: Result<RepoOpen>) -> Result<()> {
-    // three paths of one inode; whichever path owns the read fails (slowly,
-    // so the other two are waiting), and they must read the file themselves
+#[case::at_open(None)]
+#[case::mid_read(Some((5 * MAX_CHUNK / 2) as u64))]
+fn owner_read_failure_gives_waiters_their_own_read(#[case] fail_after: Option<u64>) -> Result<()> {
+    let bytes = noise(3 * MAX_CHUNK + 17);
     let mut source = Source::new(vec![
-        path("a", 5, 3, b"inode five").slow(),
-        path("b", 5, 3, b"inode five").slow(),
-        path("c", 5, 3, b"inode five").slow(),
+        path("a", 5, 3, &bytes).slow(),
+        path("b", 5, 3, &bytes).slow(),
+        path("c", 5, 3, &bytes).slow(),
     ]);
     source.fail_first = vec![(1, 5)];
+    source.fail_after = fail_after;
     let (repo, run) = archive(
-        set_up_repo?.to_indexed_ids()?,
+        small_chunk_repo()?.to_indexed_ids()?,
         &source,
         true,
         None,
@@ -271,12 +346,21 @@ fn owner_read_failure_gives_waiters_their_own_read(set_up_repo: Result<RepoOpen>
     assert_eq!(run.snapshot.summary.as_ref().unwrap().error_count, 1);
     assert_eq!(run.contents.len(), 2, "only the failed path is missing");
     let ids: Vec<_> = run.contents.values().collect();
-    assert!(!ids[0].is_empty(), "a waiter got empty content");
+    // at least ceil(len / MAX_CHUNK) blobs whatever the polynomial; the
+    // comparison with a plain read below is the exact check
+    assert!(
+        ids[0].len() >= bytes.len().div_ceil(MAX_CHUNK),
+        "a waiter got empty or partial content: {:?}",
+        run.contents
+            .iter()
+            .map(|(k, v)| (k, v.len()))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(ids[0], ids[1]);
     // and it is the real content: the same as a plain read of the bytes
     let (_, plain) = archive(
         repo,
-        &Source::new(vec![path("x", 9, 1, b"inode five")]),
+        &Source::new(vec![path("x", 9, 1, &bytes)]),
         false,
         None,
         ParentOptions::default(),
@@ -364,6 +448,8 @@ fn the_link_count_changing_between_runs(set_up_repo: Result<RepoOpen>) -> Result
     )?;
     assert_ne!(id_of(&runs[0], "a"), id_of(&runs[1], "a"));
     assert_ne!(id_of(&runs[1], "a"), id_of(&runs[2], "a"));
+    // one read per inode and run; the two links of run 2 share theirs
+    assert_eq!(runs.iter().map(|r| r.opens).collect::<Vec<_>>(), [1, 1, 1]);
     Ok(())
 }
 
@@ -393,6 +479,8 @@ fn a_parent_group_split_or_merged(set_up_repo: Result<RepoOpen>) -> Result<()> {
     )?;
     assert_ne!(id_of(&runs[1], "c"), id_of(&runs[1], "a"));
     assert_eq!(id_of(&runs[1], "y"), id_of(&runs[1], "x"));
+    // one read per inode: run 1 has inodes 5, 7, 8; run 2 has 5, 6, 7
+    assert_eq!(runs.iter().map(|r| r.opens).collect::<Vec<_>>(), [3, 3]);
     Ok(())
 }
 
@@ -460,6 +548,8 @@ fn a_weak_parent_match_does_not_vouch_for_new_paths(
         &parent_opts,
     )?;
     assert_ne!(id_of(&runs[1], "z"), id_of(&runs[0], "a"));
+    // a keeps its parent content unread; only z is read
+    assert_eq!(runs[1].opens, 1);
     Ok(())
 }
 
