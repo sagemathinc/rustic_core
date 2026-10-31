@@ -366,6 +366,20 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                         let mismatch = (node.is_dir() && !destination.file_type().is_dir())
                             || (node.is_file() && !destination.file_type().is_file())
                             || node.is_special();
+                        if mismatch && node.is_dir() && !opts.delete {
+                            // the existing entry stays, so the directory can't be created
+                            if !dry_run {
+                                return Err(RusticError::new(
+                                    ErrorKind::InputOutput,
+                                    "Cannot restore the directory `{path}`: the destination holds another type of entry there. Remove it or restore with --delete.",
+                                )
+                                .attach_context("path", path.display().to_string()));
+                            }
+                            warn!(
+                                "would fail: {} is not a directory in the destination",
+                                path.display()
+                            );
+                        }
                         if mismatch {
                             // if types do not match, first remove the existing file
                             next_dst = process_existing(&mut walker, destination)?;

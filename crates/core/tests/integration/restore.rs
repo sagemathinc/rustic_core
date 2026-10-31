@@ -257,3 +257,45 @@ fn restore_delete_replaces_entries_of_another_type(set_up_repo: Result<RepoOpen>
     assert_eq!(names, ["empty-dir", "file-a", "file-b", "full-dir"]);
     Ok(())
 }
+
+#[rstest]
+#[cfg(not(windows))]
+fn restore_without_delete_fails_on_a_directory_it_cannot_create(
+    set_up_repo: Result<RepoOpen>,
+) -> Result<()> {
+    let source = TestSource::new(tempdir()?);
+    fs::create_dir(source.path().join("empty-dir"))?;
+    fs::write(source.path().join("file"), "file")?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let _snapshot = repo.backup(
+        &BackupOptions::default().as_path(PathBuf::from("test")),
+        &source.path_list(),
+        SnapshotFile::default(),
+    )?;
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let restore_dir = tempdir()?;
+    fs::create_dir(restore_dir.path().join("test"))?;
+    fs::write(restore_dir.path().join("test/empty-dir"), "not a directory")?;
+    let dest = LocalDestination::new(restore_dir.path().to_str().unwrap(), true, false)?;
+    let opts = RestoreOptions::default().no_ownership(true);
+
+    // a dry run reports it but doesn't fail
+    let ls = repo.ls(&node, &LsOptions::default())?;
+    assert!(repo.prepare_restore(&opts, ls, &dest, true).is_ok());
+
+    let ls = repo.ls(&node, &LsOptions::default())?;
+    let err = repo
+        .prepare_restore(&opts, ls, &dest, false)
+        .expect_err("a directory that can't be created is an error");
+    assert!(
+        err.to_string().contains("Cannot restore the directory"),
+        "{err}"
+    );
+    // the existing entry is left alone
+    assert_eq!(
+        fs::read_to_string(restore_dir.path().join("test/empty-dir"))?,
+        "not a directory"
+    );
+    Ok(())
+}
