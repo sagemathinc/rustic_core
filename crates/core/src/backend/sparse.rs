@@ -88,9 +88,11 @@ fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     use nix::{
         errno::Errno,
         fcntl::{FallocateFlags, fallocate},
+        libc::off_t,
     };
-    let offset = i64::try_from(offset).map_err(io::Error::other)?;
-    let length = i64::try_from(length).map_err(io::Error::other)?;
+    // off_t is 32 bits on some targets: convert with checks, never truncate.
+    let offset = off_t::try_from(offset).map_err(io::Error::other)?;
+    let length = off_t::try_from(length).map_err(io::Error::other)?;
     fallocate(
         file,
         FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
@@ -178,7 +180,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(contents(&mut file).is_empty());
+        assert_eq!(contents(&mut file), Vec::<u8>::new());
     }
 
     #[test]

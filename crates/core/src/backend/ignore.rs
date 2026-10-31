@@ -317,6 +317,17 @@ impl ReadSource for LocalSource {
     }
 }
 
+fn ignore_error_path(err: &ignore::Error) -> Option<String> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path.display().to_string()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child.display().to_string()),
+        _ => None,
+    }
+}
+
 // Walk doesn't implement Debug
 #[allow(missing_debug_implementations)]
 pub struct LocalSourceWalker {
@@ -339,25 +350,36 @@ impl Iterator for LocalSourceWalker {
             item => item,
         }
         .map(|e| {
-            self.save_opts
-                .map_entry_with_metadata_strictness(
-                    e.map_err(|err| {
-                        RusticError::with_source(
-                            ErrorKind::Internal,
-                            "Failed to get next entry from walk iterator.",
-                            err,
-                        )
-                        .ask_report()
-                    })?,
-                    self.strict_metadata,
-                )
-                .map_err(|err| {
+            let entry = e.map_err(|err| {
+                let path = ignore_error_path(&err);
+                let rustic_err = if path.is_some() {
                     RusticError::with_source(
-                        ErrorKind::Internal,
-                        "Failed to map Directory entry to ReadSourceEntry.",
+                        ErrorKind::InputOutput,
+                        "Failed to read source path `{path}`.",
                         err,
                     )
-                    .ask_report()
+                } else {
+                    RusticError::with_source(
+                        ErrorKind::InputOutput,
+                        "Failed to read source path.",
+                        err,
+                    )
+                };
+                match path {
+                    Some(path) => rustic_err.attach_context("path", path),
+                    None => rustic_err,
+                }
+            })?;
+            let path = entry.path().display().to_string();
+            self.save_opts
+                .map_entry_with_metadata_strictness(entry, self.strict_metadata)
+                .map_err(|err| {
+                    RusticError::with_source(
+                        ErrorKind::InputOutput,
+                        "Failed to map directory entry `{path}` to a backup source entry.",
+                        err,
+                    )
+                    .attach_context("path", path)
                 })
         })
     }
