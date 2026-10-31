@@ -20,8 +20,8 @@ use pretty_assertions::assert_eq;
 use rstest::rstest;
 
 use rustic_core::{
-    BackupOptions, IndexedIds, IndexedIdsStatus, LsOptions, ParentOptions, ReadSource, ReadSourceEntry,
-    ReadSourceOpen, Repository, RusticResult,
+    BackupOptions, IndexedIds, IndexedIdsStatus, LsOptions, ParentOptions, ReadSource,
+    ReadSourceEntry, ReadSourceOpen, Repository, RusticResult,
     repofile::{Metadata, Node, NodeType, SnapshotFile},
 };
 
@@ -219,11 +219,7 @@ fn archive<S: IndexedIds>(
 /// Archive each source in turn (each with the previous snapshot as parent),
 /// with and without reuse; return the runs with reuse, after checking that
 /// every run gave every path the same content both ways.
-fn differential(
-    repo: RepoOpen,
-    runs: &[Source],
-    parent_opts: &ParentOptions,
-) -> Result<Vec<Run>> {
+fn differential(repo: RepoOpen, runs: &[Source], parent_opts: &ParentOptions) -> Result<Vec<Run>> {
     let mut repo = repo.to_indexed_ids()?;
     let mut results = Vec::new();
     for reuse in [false, true] {
@@ -290,9 +286,7 @@ fn owner_read_failure_gives_waiters_their_own_read(set_up_repo: Result<RepoOpen>
 }
 
 #[rstest]
-fn the_same_inode_number_on_two_devices_is_two_files(
-    set_up_repo: Result<RepoOpen>,
-) -> Result<()> {
+fn the_same_inode_number_on_two_devices_is_two_files(set_up_repo: Result<RepoOpen>) -> Result<()> {
     // identical stat apart from the device, different bytes
     let runs = differential(
         set_up_repo?,
@@ -336,7 +330,10 @@ fn an_inode_number_reused_with_the_same_size_and_mtime_is_read(
     let runs = differential(
         set_up_repo?,
         &[
-            Source::new(vec![path("a", 5, 2, b"first file"), path("b", 5, 2, b"first file")]),
+            Source::new(vec![
+                path("a", 5, 2, b"first file"),
+                path("b", 5, 2, b"first file"),
+            ]),
             Source::new(vec![
                 path("a", 5, 2, b"other file").ctime(1_600_000_500),
                 path("b", 5, 2, b"other file").ctime(1_600_000_500),
