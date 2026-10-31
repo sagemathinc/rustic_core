@@ -84,8 +84,7 @@ impl ParentOptions {
     ///
     /// # Type Parameters
     ///
-    /// * `P` - The type of the progress bars.
-    /// * `S` - The type of the indexed tree.
+    /// * `R` - The type of the indexed tree (repository).
     ///
     /// # Arguments
     ///
@@ -95,9 +94,9 @@ impl ParentOptions {
     /// # Returns
     ///
     /// The parent snapshot ids and the parent object.
-    pub(crate) fn get_parent<S: IndexedTree>(
+    pub(crate) fn get_parent<R: IndexedTree>(
         &self,
-        repo: &Repository<S>,
+        repo: &Repository<R>,
         snap: &SnapshotFile,
     ) -> (Vec<SnapshotId>, Parent) {
         let group = SnapshotGroup::from_snapshot(snap, self.group_by.unwrap_or_default());
@@ -208,12 +207,12 @@ pub struct BackupOptions {
     pub ignore_filter_opts: LocalSourceFilterOptions,
 }
 
-/// Backup data, create a snapshot.
+/// Archive data, create a snapshot.
 ///
 /// # Type Parameters
 ///
-/// * `P` - The type of the progress bars.
-/// * `S` - The type of the indexed tree.
+/// * `R` - The type of the indexed IDs (repository).
+/// * `S` - The type of the backup source.
 ///
 /// # Arguments
 ///
@@ -233,18 +232,18 @@ pub struct BackupOptions {
 /// # Returns
 ///
 /// The snapshot pointing to the backup'ed data.
-pub(crate) fn archive<R, S>(
-    repo: &Repository<S>,
+pub(crate) fn archive<S, R>(
+    repo: &Repository<R>,
     opts: &BackupOptions,
-    src: &R,
+    src: &S,
     mut snap: SnapshotFile,
     backup_paths: &[PathBuf],
 ) -> RusticResult<SnapshotFile>
 where
-    S: IndexedIds,
-    R: ReadSource + 'static,
-    <R as ReadSource>::Open: Send,
-    <R as ReadSource>::Iter: Send,
+    R: IndexedIds,
+    S: ReadSource + 'static,
+    <S as ReadSource>::Open: Send,
+    <S as ReadSource>::Iter: Send,
 {
     if opts.admission.enabled() {
         let inventory = backup_inventory(src, repo.config(), &opts.admission)?;
@@ -316,7 +315,7 @@ where
 ///
 /// # Type Parameters
 ///
-/// * `S` - The type of the indexed tree.
+/// * `R` - The type of the indexed IDs (repository).
 ///
 /// # Arguments
 ///
@@ -336,8 +335,8 @@ where
 /// # Returns
 ///
 /// The snapshot pointing to the backup'ed data.
-pub(crate) fn backup<S: IndexedIds>(
-    repo: &Repository<S>,
+pub(crate) fn backup<R: IndexedIds>(
+    repo: &Repository<R>,
     opts: &BackupOptions,
     source: &PathList,
     snap: SnapshotFile,
