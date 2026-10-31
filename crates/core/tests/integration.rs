@@ -30,6 +30,7 @@ mod integration {
     mod copy;
     mod dump;
     mod find;
+    mod hardlinks;
     mod hotcold;
     mod key;
     mod ls;
