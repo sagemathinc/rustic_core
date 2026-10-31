@@ -14,7 +14,9 @@ use pariter::IteratorExt;
 use crate::{
     Progress,
     archiver::{
-        file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
+        file_archiver::FileArchiver,
+        parent::{Parent, ParentResult},
+        tree::{TreeIterator, TreeType},
         tree_archiver::TreeArchiver,
     },
     backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
@@ -166,6 +168,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     {
         let incomplete = AtomicBool::new(false);
         let error_count = AtomicU64::new(0);
+        let hardlinks = self.file_archiver.hardlink_cache();
 
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
@@ -222,7 +225,18 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             // use parent snapshot
             iter.filter_map(
                 |item| match self.parent.process(&self.be, self.index, item) {
-                    Ok(item) => Some(item),
+                    Ok(item) => {
+                        // Seed the hard-link cache here, in order, before any
+                        // later path of the same inode reaches a worker.
+                        if let (
+                            Some(cache),
+                            TreeType::Other((_, node, (_, ParentResult::Matched(())))),
+                        ) = (&hardlinks, &item)
+                        {
+                            cache.seed(node);
+                        }
+                        Some(item)
+                    }
                     Err(err) => {
                         incomplete.store(true, Ordering::Relaxed);
                         warn!("ignoring error reading parent snapshot: {err:?}");

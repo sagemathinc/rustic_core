@@ -566,3 +566,150 @@ fn reuse_hardlinks_keeps_each_inode_s_own_content(set_up_repo: Result<RepoOpen>)
     assert_ne!(content["single"], content["one"]);
     Ok(())
 }
+
+/// A source of files whose opens are counted; the first open is slow, so
+/// that other paths reach the archiver while it is still reading.
+struct CountingSource {
+    names: Vec<&'static str>,
+    opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CountingOpen {
+    opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl rustic_core::ReadSourceOpen for CountingOpen {
+    type Reader = std::io::Cursor<Vec<u8>>;
+    fn open(self) -> rustic_core::RusticResult<Self::Reader> {
+        if self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        Ok(std::io::Cursor::new(vec![42; 65536]))
+    }
+}
+
+impl rustic_core::ReadSource for CountingSource {
+    type Open = CountingOpen;
+    type Iter =
+        std::vec::IntoIter<rustic_core::RusticResult<rustic_core::ReadSourceEntry<CountingOpen>>>;
+
+    fn size(&self) -> rustic_core::RusticResult<Option<u64>> {
+        Ok(None)
+    }
+
+    fn entries(&self) -> Self::Iter {
+        use rustic_core::{
+            ReadSourceEntry,
+            repofile::{Metadata, Node, NodeType},
+        };
+        let when = jiff::Timestamp::from_second(1_600_000_000).unwrap();
+        self.names
+            .iter()
+            .map(|name| {
+                Ok(ReadSourceEntry {
+                    path: PathBuf::from("test").join(name),
+                    // every name is a path of the same inode
+                    node: Node::new_node(
+                        name.as_ref(),
+                        NodeType::File,
+                        Metadata {
+                            size: 65536,
+                            links: 2,
+                            inode: 77,
+                            device_id: 1,
+                            mtime: Some(when),
+                            ctime: Some(when),
+                            ..Metadata::default()
+                        },
+                    ),
+                    open: Some(CountingOpen {
+                        opens: self.opens.clone(),
+                    }),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn strict_entries(&self) -> Self::Iter {
+        self.entries()
+    }
+}
+
+fn count_opens<S: rustic_core::IndexedIds>(
+    repo: &rustic_core::Repository<S>,
+    names: Vec<&'static str>,
+    reuse: bool,
+) -> Result<usize> {
+    Ok(archive_counting(repo, names, reuse, None)?.0)
+}
+
+/// Archive the paths (with this parent snapshot, if any); return the number
+/// of opens and the snapshot.
+fn archive_counting<S: rustic_core::IndexedIds>(
+    repo: &rustic_core::Repository<S>,
+    names: Vec<&'static str>,
+    reuse: bool,
+    parent: Option<&SnapshotFile>,
+) -> Result<(usize, SnapshotFile)> {
+    let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = CountingSource {
+        names,
+        opens: opens.clone(),
+    };
+    let parents: Vec<String> = parent.iter().map(|snap| snap.id.to_string()).collect();
+    let snapshot = repo.archive(
+        &BackupOptions::default()
+            .no_scan(true)
+            .reuse_hardlinks(reuse)
+            .parent_opts(ParentOptions::default().parents(parents)),
+        &source,
+        SnapshotFile::default(),
+        &[PathBuf::from("test")],
+    )?;
+    Ok((opens.load(std::sync::atomic::Ordering::SeqCst), snapshot))
+}
+
+#[rstest]
+fn without_reuse_hardlinks_every_path_is_read(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    // shows that counting opens detects a double read
+    assert_eq!(
+        count_opens(&repo, vec!["a", "b", "c", "d", "e", "f", "g", "h"], false)?,
+        8
+    );
+    Ok(())
+}
+
+#[rstest]
+fn reuse_hardlinks_reads_once_per_run(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    // a fresh repository: no parent, every path new, all scheduled together
+    assert_eq!(
+        count_opens(&repo, vec!["a", "b", "c", "d", "e", "f", "g", "h"], true)?,
+        1
+    );
+    Ok(())
+}
+
+#[rstest]
+fn reuse_hardlinks_seeds_from_a_parent_match(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    // first run: one path of the inode
+    let (opens, first) = archive_counting(&repo, vec!["a"], true, None)?;
+    assert_eq!(opens, 1);
+    // reload the index, so that the first run's blobs are known
+    let repo = repo.drop_index().to_indexed_ids()?;
+    // without the option, the new path "z" is read
+    assert_eq!(
+        archive_counting(&repo, vec!["a", "z"], false, Some(&first))?.0,
+        1
+    );
+    // with it, "a" matches its parent and seeds the cache, and "z", a new path
+    // of the same unchanged inode, reuses that content: nothing is opened
+    assert_eq!(
+        archive_counting(&repo, vec!["a", "z"], true, Some(&first))?.0,
+        0
+    );
+    Ok(())
+}

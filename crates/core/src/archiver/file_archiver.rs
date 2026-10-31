@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     io::Read,
-    sync::{Arc, Mutex},
+    path::Path,
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
 };
 
 use jiff::Timestamp;
@@ -58,10 +59,85 @@ struct HardlinkState {
     ctime: Timestamp,
 }
 
-/// Content of multiply hard-linked files archived in this run.
+/// One inode in this run: its archived content, or the read in progress.
+#[derive(Debug)]
+enum Slot {
+    Done(HardlinkState, Vec<DataId>),
+    Reading(HardlinkState, Arc<Pending>),
+}
+
+/// A read in progress that other paths of the same inode wait for.
+#[derive(Debug, Default)]
+struct Pending {
+    /// `None` while reading; then `Some(Some(content))`, or `Some(None)` if
+    /// the read failed.
+    outcome: Mutex<Option<Option<Vec<DataId>>>>,
+    finished: Condvar,
+}
+
+impl Pending {
+    fn wait(&self) -> Option<Vec<DataId>> {
+        let mut outcome = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
+        while outcome.is_none() {
+            outcome = self
+                .finished
+                .wait(outcome)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        outcome.clone().flatten()
+    }
+
+    fn finish(&self, content: Option<Vec<DataId>>) {
+        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(content);
+        self.finished.notify_all();
+    }
+}
+
+/// What a worker does with a file (see [`HardlinkCache::claim`]).
+#[derive(Debug)]
+pub(crate) enum Claim<'c> {
+    /// Read the file, as without the cache.
+    Read,
+    /// Use this content: the same inode, unchanged, archived in this run.
+    Reuse(Vec<DataId>),
+    /// Read the file for every path of this inode; others wait for it.
+    Own(OwnedRead<'c>),
+}
+
+/// The duty to read an inode for all its paths. Finishing it publishes the
+/// content; dropping it unfinished (an error, a panic) lets the waiting
+/// paths read the file themselves, and nothing is cached.
+#[derive(Debug)]
+pub(crate) struct OwnedRead<'c> {
+    cache: &'c HardlinkCache,
+    key: InodeKey,
+    state: HardlinkState,
+    pending: Arc<Pending>,
+    finished: bool,
+}
+
+impl OwnedRead<'_> {
+    pub(crate) fn finish(mut self, content: Option<&Vec<DataId>>) {
+        self.finished = true;
+        self.cache
+            .finish(self.key, &self.state, &self.pending, content.cloned());
+    }
+}
+
+impl Drop for OwnedRead<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cache
+                .finish(self.key, &self.state, &self.pending, None);
+        }
+    }
+}
+
+/// Content of multiply hard-linked files archived in this run, so that each
+/// such inode is read once: one path reads it, the others wait and reuse.
 #[derive(Debug, Default)]
 pub(crate) struct HardlinkCache {
-    entries: Mutex<HashMap<InodeKey, (HardlinkState, Vec<DataId>)>>,
+    slots: Mutex<HashMap<InodeKey, Slot>>,
 }
 
 impl HardlinkCache {
@@ -82,24 +158,76 @@ impl HardlinkCache {
         ))
     }
 
-    /// The content archived in this run for this node's inode, if the node
-    /// looks exactly as it did then.
-    fn get(&self, node: &Node) -> Option<Vec<DataId>> {
-        let (key, state) = Self::key_and_state(node)?;
-        let entries = self.entries.lock().ok()?;
-        entries
-            .get(&key)
-            .filter(|(seen, _)| *seen == state)
-            .map(|(_, content)| content.clone())
+    fn slots(&self) -> MutexGuard<'_, HashMap<InodeKey, Slot>> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Remember the content archived for this node's inode.
-    fn insert(&self, node: &Node) {
+    /// Decide how to get this node's content: reuse it, wait for the path
+    /// reading it now (never holding the map's lock while waiting), or read
+    /// it for all paths of the inode.
+    pub(crate) fn claim(&self, node: &Node) -> Claim<'_> {
+        let Some((key, state)) = Self::key_and_state(node) else {
+            return Claim::Read;
+        };
+        let pending = {
+            let mut slots = self.slots();
+            match slots.get(&key) {
+                Some(Slot::Done(seen, content)) if *seen == state => {
+                    return Claim::Reuse(content.clone());
+                }
+                Some(Slot::Reading(seen, pending)) if *seen == state => Arc::clone(pending),
+                _ => {
+                    let pending = Arc::new(Pending::default());
+                    _ = slots.insert(key, Slot::Reading(state.clone(), Arc::clone(&pending)));
+                    return Claim::Own(OwnedRead {
+                        cache: self,
+                        key,
+                        state,
+                        pending,
+                        finished: false,
+                    });
+                }
+            }
+        };
+        pending.wait().map_or(Claim::Read, Claim::Reuse)
+    }
+
+    /// Publish (or, on failure, withdraw) an owned read, if the slot is still
+    /// that read's, and wake its waiters.
+    fn finish(
+        &self,
+        key: InodeKey,
+        state: &HardlinkState,
+        pending: &Arc<Pending>,
+        content: Option<Vec<DataId>>,
+    ) {
+        {
+            let mut slots = self.slots();
+            if let Some(Slot::Reading(_, current)) = slots.get(&key) {
+                if Arc::ptr_eq(current, pending) {
+                    match &content {
+                        Some(content) => {
+                            _ = slots.insert(key, Slot::Done(state.clone(), content.clone()));
+                        }
+                        None => {
+                            _ = slots.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        pending.finish(content);
+    }
+
+    /// Remember content known without reading: a file unchanged since its
+    /// parent snapshot.
+    pub(crate) fn seed(&self, node: &Node) {
         let (Some((key, state)), Some(content)) = (Self::key_and_state(node), &node.content) else {
             return;
         };
-        if let Ok(mut entries) = self.entries.lock() {
-            _ = entries.insert(key, (state, content.clone()));
+        let mut slots = self.slots();
+        if !matches!(slots.get(&key), Some(Slot::Reading(..))) {
+            _ = slots.insert(key, Slot::Done(state, content.clone()));
         }
     }
 }
@@ -146,6 +274,11 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         self.hardlinks = reuse.then(|| Arc::new(HardlinkCache::default()));
     }
 
+    /// The hard-link cache, if enabled (seeded from parent matches).
+    pub(crate) fn hardlink_cache(&self) -> Option<Arc<HardlinkCache>> {
+        self.hardlinks.clone()
+    }
+
     /// Processes the given item.
     ///
     /// # Type Parameters
@@ -173,53 +306,72 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             TreeType::NewTree(item) => TreeType::NewTree(item),
             TreeType::EndTree => TreeType::EndTree,
             TreeType::Other((path, node, (open, parent))) => {
-                let reused = if matches!(parent, ParentResult::Matched(())) {
-                    None
-                } else {
-                    self.hardlinks.as_ref().and_then(|cache| cache.get(&node))
-                };
                 let (node, filesize) = if matches!(parent, ParentResult::Matched(())) {
                     let size = node.meta.size;
                     p.inc(size);
                     (node, size)
-                } else if let Some(content) = reused {
-                    // Another path of this inode, unchanged since its content
-                    // was archived in this run.
-                    let mut node = node;
-                    node.content = Some(content);
-                    let size = node.meta.size;
-                    p.inc(size);
-                    (node, size)
                 } else if node.node_type == NodeType::File {
-                    let r = open
-                        .ok_or_else(
-                            || RusticError::new(
-                                ErrorKind::Internal,
-                                "Failed to unpack tree type optional at `{path}`. Option should contain a value, but contained `None`.",
-                            )
-                            .attach_context("path", path.display().to_string())
-                            .ask_report(),
-                        )?
-                        .open_with_holes()
-                        .map_err(|err| {
-                            err
-                            .overwrite_kind(ErrorKind::InputOutput)
-                            .prepend_guidance_line("Failed to open ReadSourceOpen at `{path}`")
-                            .attach_context("path", path.display().to_string())
-                        })?;
-
-                    self.backup_reader(r, node, p).map_err(|err| {
-                        err.prepend_guidance_line("Error while backing up `{path}`")
-                            .attach_context("path", path.display().to_string())
-                    })?
+                    let claim = self
+                        .hardlinks
+                        .as_deref()
+                        .map_or(Claim::Read, |cache| cache.claim(&node));
+                    match claim {
+                        Claim::Reuse(content) => {
+                            // Another path of this inode, unchanged since its
+                            // content was archived in this run.
+                            let mut node = node;
+                            node.content = Some(content);
+                            let size = node.meta.size;
+                            p.inc(size);
+                            (node, size)
+                        }
+                        Claim::Read => self.read_file(&path, open, node, p)?,
+                        Claim::Own(owned) => {
+                            let result = self.read_file(&path, open, node, p);
+                            owned.finish(
+                                result
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|(node, _)| node.content.as_ref()),
+                            );
+                            result?
+                        }
+                    }
                 } else {
                     (node, 0)
                 };
-                if let Some(cache) = &self.hardlinks {
-                    cache.insert(&node);
-                }
                 TreeType::Other((path, node, (parent, filesize)))
             }
+        })
+    }
+
+    /// Open and archive a regular file.
+    fn read_file<O: ReadSourceOpen>(
+        &self,
+        path: &Path,
+        open: Option<O>,
+        node: Node,
+        p: &Progress,
+    ) -> RusticResult<(Node, u64)> {
+        let r = open
+            .ok_or_else(
+                || RusticError::new(
+                    ErrorKind::Internal,
+                    "Failed to unpack tree type optional at `{path}`. Option should contain a value, but contained `None`.",
+                )
+                .attach_context("path", path.display().to_string())
+                .ask_report(),
+            )?
+            .open_with_holes()
+            .map_err(|err| {
+                err
+                .overwrite_kind(ErrorKind::InputOutput)
+                .prepend_guidance_line("Failed to open ReadSourceOpen at `{path}`")
+                .attach_context("path", path.display().to_string())
+            })?;
+        self.backup_reader(r, node, p).map_err(|err| {
+            err.prepend_guidance_line("Error while backing up `{path}`")
+                .attach_context("path", path.display().to_string())
         })
     }
 
@@ -291,7 +443,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::{ffi::OsStr, sync::mpsc, thread, time::Duration};
 
     use super::*;
     use crate::backend::node::Metadata;
@@ -312,58 +464,120 @@ mod tests {
         )
     }
 
-    fn archived(mut node: Node, content: &[u8]) -> Node {
-        node.content = Some(vec![DataId::from(hash(content))]);
-        node
+    fn content(bytes: &[u8]) -> Vec<DataId> {
+        vec![DataId::from(hash(bytes))]
+    }
+
+    fn own(claim: Claim<'_>) -> OwnedRead<'_> {
+        match claim {
+            Claim::Own(owned) => owned,
+            other => panic!("expected to own the read, got {other:?}"),
+        }
     }
 
     #[test]
-    fn another_path_of_an_unchanged_inode_reuses_its_content() {
+    fn the_first_path_reads_and_later_paths_reuse() {
         let cache = HardlinkCache::default();
-        cache.insert(&archived(file(2, 42, 3, 100, 200), b"abc"));
-        assert_eq!(
-            cache.get(&file(2, 42, 3, 100, 200)),
-            Some(vec![DataId::from(hash(b"abc"))])
-        );
+        own(cache.claim(&file(2, 42, 3, 100, 200))).finish(Some(&content(b"abc")));
+        assert!(matches!(
+            cache.claim(&file(2, 42, 3, 100, 200)),
+            Claim::Reuse(c) if c == content(b"abc")
+        ));
+    }
+
+    #[test]
+    fn a_path_waits_for_the_read_in_progress_and_reuses_it() {
+        let cache = Arc::new(HardlinkCache::default());
+        let owned = own(cache.claim(&file(2, 42, 3, 100, 200)));
+        let (sender, receiver) = mpsc::channel();
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                let claim = cache.claim(&file(2, 42, 3, 100, 200));
+                let result = match claim {
+                    Claim::Reuse(c) => Some(c),
+                    _ => None,
+                };
+                sender.send(result).unwrap();
+            })
+        };
+        // the second path does not read while the first one is reading
+        assert!(receiver.recv_timeout(Duration::from_millis(200)).is_err());
+        owned.finish(Some(&content(b"abc")));
+        assert_eq!(receiver.recv().unwrap(), Some(content(b"abc")));
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_read_lets_waiters_read_and_caches_nothing() {
+        let cache = Arc::new(HardlinkCache::default());
+        let owned = own(cache.claim(&file(2, 42, 3, 100, 200)));
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || matches!(cache.claim(&file(2, 42, 3, 100, 200)), Claim::Read))
+        };
+        thread::sleep(Duration::from_millis(100));
+        drop(owned); // an error or a panic before finishing
+        assert!(waiter.join().unwrap(), "the waiter reads the file itself");
+        // and a later path owns a fresh read rather than reusing anything
+        let again = own(cache.claim(&file(2, 42, 3, 100, 200)));
+        again.finish(None);
+        assert!(matches!(
+            cache.claim(&file(2, 42, 3, 100, 200)),
+            Claim::Own(_)
+        ));
     }
 
     #[test]
     fn any_difference_reads_the_file() {
         let cache = HardlinkCache::default();
-        cache.insert(&archived(file(2, 42, 3, 100, 200), b"abc"));
+        own(cache.claim(&file(2, 42, 3, 100, 200))).finish(Some(&content(b"abc")));
         for other in [
             file(2, 43, 3, 100, 200), // another inode
             file(2, 42, 4, 100, 200), // size changed
             file(2, 42, 3, 101, 200), // mtime changed
             file(2, 42, 3, 100, 201), // ctime changed
         ] {
-            assert_eq!(cache.get(&other), None);
+            let owned = own(cache.claim(&other));
+            owned.finish(None);
         }
         let mut other_device = file(2, 42, 3, 100, 200);
         other_device.meta.device_id = 8;
-        assert_eq!(cache.get(&other_device), None);
+        assert!(matches!(cache.claim(&other_device), Claim::Own(_)));
     }
 
     #[test]
     fn only_multiply_linked_regular_files_with_known_identity_take_part() {
         let cache = HardlinkCache::default();
-        for node in [
-            file(1, 42, 3, 100, 200), // a single link
-            file(2, 0, 3, 100, 200),  // unknown inode
-        ] {
-            cache.insert(&archived(node.clone(), b"abc"));
-            assert_eq!(cache.get(&node), None);
-        }
         let mut no_ctime = file(2, 42, 3, 100, 200);
         no_ctime.meta.ctime = None;
-        cache.insert(&archived(no_ctime.clone(), b"abc"));
-        assert_eq!(cache.get(&no_ctime), None);
         let mut dir = file(2, 44, 3, 100, 200);
         dir.node_type = NodeType::Dir;
-        cache.insert(&archived(dir.clone(), b"abc"));
-        assert_eq!(cache.get(&dir), None);
-        // a node without content (not archived) is not remembered
-        cache.insert(&file(2, 45, 3, 100, 200));
-        assert_eq!(cache.get(&file(2, 45, 3, 100, 200)), None);
+        for node in [
+            file(1, 42, 3, 100, 200),
+            file(2, 0, 3, 100, 200),
+            no_ctime,
+            dir,
+        ] {
+            assert!(matches!(cache.claim(&node), Claim::Read));
+        }
+    }
+
+    #[test]
+    fn a_parent_match_seeds_the_cache() {
+        let cache = HardlinkCache::default();
+        let mut unchanged = file(2, 42, 3, 100, 200);
+        unchanged.content = Some(content(b"abc"));
+        cache.seed(&unchanged);
+        assert!(matches!(
+            cache.claim(&file(2, 42, 3, 100, 200)),
+            Claim::Reuse(c) if c == content(b"abc")
+        ));
+        // a node without content (nothing archived) seeds nothing
+        cache.seed(&file(2, 45, 3, 100, 200));
+        assert!(matches!(
+            cache.claim(&file(2, 45, 3, 100, 200)),
+            Claim::Own(_)
+        ));
     }
 }
