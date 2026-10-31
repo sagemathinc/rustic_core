@@ -202,3 +202,58 @@ fn strict_restore_reports_metadata_failure(set_up_repo: Result<RepoOpen>) -> Res
     }
     Ok(())
 }
+
+#[rstest]
+#[cfg(not(windows))]
+fn restore_delete_replaces_entries_of_another_type(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let source = TestSource::new(tempdir()?);
+    fs::create_dir(source.path().join("empty-dir"))?;
+    fs::create_dir(source.path().join("full-dir"))?;
+    fs::write(source.path().join("full-dir/child"), "child")?;
+    fs::write(source.path().join("file-a"), "file a")?;
+    fs::write(source.path().join("file-b"), "file b")?;
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let _snapshot = repo.backup(
+        &BackupOptions::default().as_path(PathBuf::from("test")),
+        &source.path_list(),
+        SnapshotFile::default(),
+    )?;
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_path("latest", |_| true)?;
+    let restore_dir = tempdir()?;
+    let dest = LocalDestination::new(restore_dir.path().to_str().unwrap(), true, false)?;
+    let opts = RestoreOptions::default().delete(true).no_ownership(true);
+    let restore = || -> Result<()> {
+        let ls = repo.ls(&node, &LsOptions::default())?;
+        let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
+        repo.restore(plan, &opts, ls, &dest)?;
+        Ok(())
+    };
+    restore()?;
+
+    // A file where each directory was, a directory where each file was.
+    let target = restore_dir.path().join("test");
+    fs::remove_dir(target.join("empty-dir"))?;
+    fs::write(target.join("empty-dir"), "not a directory")?;
+    fs::remove_dir_all(target.join("full-dir"))?;
+    fs::write(target.join("full-dir"), "not a directory")?;
+    fs::remove_file(target.join("file-a"))?;
+    fs::create_dir(target.join("file-a"))?;
+    fs::remove_file(target.join("file-b"))?;
+    fs::create_dir(target.join("file-b"))?;
+    fs::write(target.join("file-b/inside"), "not in the snapshot")?;
+    restore()?;
+
+    assert!(fs::symlink_metadata(target.join("empty-dir"))?.is_dir());
+    assert_eq!(fs::read_dir(target.join("empty-dir"))?.count(), 0);
+    assert!(fs::symlink_metadata(target.join("full-dir"))?.is_dir());
+    assert_eq!(fs::read_to_string(target.join("full-dir/child"))?, "child");
+    assert_eq!(fs::read_to_string(target.join("file-a"))?, "file a");
+    assert_eq!(fs::read_to_string(target.join("file-b"))?, "file b");
+    let mut names: Vec<_> = fs::read_dir(&target)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<_, _>>()?;
+    names.sort();
+    assert_eq!(names, ["empty-dir", "file-a", "file-b", "full-dir"]);
+    Ok(())
+}
