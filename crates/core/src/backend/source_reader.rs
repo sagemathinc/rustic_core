@@ -56,25 +56,24 @@ impl<R: Read> SourceReader<R> {
         {
             use nix::{
                 errno::Errno,
+                libc::off_t,
                 unistd::{Whence, lseek},
             };
             if !*holes || length == 0 {
                 return Ok(false);
             }
-            let end = offset
-                .checked_add(length as u64)
-                .and_then(|value| i64::try_from(value).ok())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "hole offset overflow")
-                })?;
+            let overflow = || io::Error::new(io::ErrorKind::InvalidInput, "hole offset overflow");
+            // off_t is 32 bits on some targets: convert with checks, never truncate.
+            let end_offset = offset.checked_add(length as u64).ok_or_else(overflow)?;
+            let end = off_t::try_from(end_offset).map_err(|_| overflow())?;
             let next_data = lseek(
                 &*file,
-                i64::try_from(*offset).map_err(io::Error::other)?,
+                off_t::try_from(*offset).map_err(|_| overflow())?,
                 Whence::SeekData,
             );
             let is_hole = match next_data {
                 Ok(data) => data >= end,
-                Err(Errno::ENXIO) => file.metadata()?.len() >= end.cast_unsigned(),
+                Err(Errno::ENXIO) => file.metadata()?.len() >= end_offset,
                 Err(Errno::EINVAL | Errno::EOPNOTSUPP | Errno::ENOSYS) => {
                     *holes = false;
                     false
@@ -82,7 +81,7 @@ impl<R: Read> SourceReader<R> {
                 Err(err) => return Err(io::Error::from_raw_os_error(err as i32)),
             };
             let position = if is_hole {
-                end.cast_unsigned()
+                end_offset
             } else {
                 *offset
             };
