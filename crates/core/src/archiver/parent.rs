@@ -378,10 +378,46 @@ mod tests {
             stack: Vec::new(),
             ignore_ctime: false,
             ignore_inode,
+            last_match_vouches_for_inode: false,
         };
 
         let result = parent.is_parent(&file_with_inode(2), OsStr::new("file"));
 
         assert_eq!(matches!(result, ParentResult::Matched(_)), expected_match);
+    }
+
+    fn file_with(device_id: u64, inode: u64, ctime: Option<i64>) -> Node {
+        let meta = Metadata {
+            device_id,
+            inode,
+            ctime: ctime.map(|s| jiff::Timestamp::from_second(s).unwrap()),
+            ..Metadata::default()
+        };
+        Node::new_node(OsStr::new("file"), NodeType::File, meta)
+    }
+
+    #[rstest]
+    #[case::all_equal(false, false, (1, 5, Some(9)), (1, 5, Some(9)), true)]
+    #[case::ignore_ctime(true, false, (1, 5, Some(9)), (1, 5, Some(9)), false)]
+    #[case::ignore_inode(false, true, (1, 5, Some(9)), (1, 5, Some(9)), false)]
+    #[case::parent_inode_zero(false, false, (1, 0, Some(9)), (1, 0, Some(9)), false)]
+    #[case::inode_differs(false, false, (1, 5, Some(9)), (1, 6, Some(9)), false)]
+    #[case::device_differs(false, false, (1, 5, Some(9)), (2, 5, Some(9)), false)]
+    #[case::ctime_missing(false, false, (1, 5, None), (1, 5, None), false)]
+    #[case::parent_ctime_missing(false, false, (1, 5, None), (1, 5, Some(9)), false)]
+    #[case::ctime_differs(false, false, (1, 5, Some(9)), (1, 5, Some(10)), false)]
+    fn only_a_full_identity_match_vouches_for_the_inode(
+        #[case] ignore_ctime: bool,
+        #[case] ignore_inode: bool,
+        #[case] parent: (u64, u64, Option<i64>),
+        #[case] current: (u64, u64, Option<i64>),
+        #[case] expected: bool,
+    ) {
+        let p_node = file_with(parent.0, parent.1, parent.2);
+        let node = file_with(current.0, current.1, current.2);
+        assert_eq!(
+            Parent::vouches_for_inode(ignore_ctime, ignore_inode, &p_node, &node),
+            expected
+        );
     }
 }
