@@ -396,27 +396,34 @@ fn a_parent_group_split_or_merged(set_up_repo: Result<RepoOpen>) -> Result<()> {
     Ok(())
 }
 
-/// A parent match made without comparing ctime (`--ignore-ctime`) trusts that
-/// one path.  Reuse must not extend that trust to a path of the inode that has
-/// no parent entry: without reuse, that path is read.
+/// A parent match that did not compare ctime and inode trusts that one path.
+/// Reuse must not extend that trust to a path of the inode that has no parent
+/// entry: without reuse, that path is read.  A match is weak when an ignore
+/// option is set, or when the parent entry has no ctime or no inode number.
 #[rstest]
-#[case::ignore_ctime(ParentOptions::default().ignore_ctime(true), 5, 1_600_000_100)]
-#[case::ignore_inode(ParentOptions::default().ignore_inode(true), 6, 1_600_000_000)]
+#[case::ignore_ctime(ParentOptions::default().ignore_ctime(true), (5, Some(T0)), (5, T1))]
+#[case::ignore_inode(ParentOptions::default().ignore_inode(true), (5, Some(T0)), (6, T0))]
+#[case::parent_without_ctime(ParentOptions::default(), (5, None), (5, T1))]
+#[case::parent_without_inode(ParentOptions::default(), (0, Some(T0)), (6, T0))]
 fn a_weak_parent_match_does_not_vouch_for_new_paths(
     set_up_repo: Result<RepoOpen>,
     #[case] parent_opts: ParentOptions,
-    #[case] second_inode: u64,
-    #[case] second_ctime: i64,
+    #[case] first: (u64, Option<i64>),
+    #[case] second: (u64, i64),
 ) -> Result<()> {
-    // run 2: a has new bytes (same size and mtime) and a new link z; with the
-    // ctime (or the inode) that differs ignored, a matches its parent entry
+    // run 2: a has new bytes (same size and mtime) and a new link z; what
+    // differs from run 1 is not compared, so a matches its parent entry
+    let run1 = Path {
+        ctime: first.1,
+        ..path("a", first.0, 1, b"old bytes")
+    };
     let runs = differential(
         set_up_repo?,
         &[
-            Source::new(vec![path("a", 5, 1, b"old bytes")]),
+            Source::new(vec![run1]),
             Source::new(vec![
-                path("a", second_inode, 2, b"new bytes").ctime(second_ctime),
-                path("z", second_inode, 2, b"new bytes").ctime(second_ctime),
+                path("a", second.0, 2, b"new bytes").ctime(second.1),
+                path("z", second.0, 2, b"new bytes").ctime(second.1),
             ]),
         ],
         &parent_opts,
@@ -424,3 +431,6 @@ fn a_weak_parent_match_does_not_vouch_for_new_paths(
     assert_ne!(id_of(&runs[1], "z"), id_of(&runs[0], "a"));
     Ok(())
 }
+
+const T0: i64 = 1_600_000_000;
+const T1: i64 = 1_600_000_100;
