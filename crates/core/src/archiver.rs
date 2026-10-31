@@ -120,6 +120,14 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         self
     }
 
+    /// Read each multiply hard-linked file only once in this run (see
+    /// `BackupOptions::reuse_hardlinks`).
+    #[must_use]
+    pub fn reuse_hardlinks(mut self, reuse: bool) -> Self {
+        self.file_archiver.reuse_hardlinks(reuse);
+        self
+    }
+
     /// Archives the given source.
     ///
     /// This will archive all files and trees in the given source.

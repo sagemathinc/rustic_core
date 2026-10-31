@@ -516,3 +516,53 @@ fn test_backup_unreadable_file_sets_error_count(set_up_repo: Result<RepoOpen>) -
 
     Ok(())
 }
+
+#[cfg(unix)]
+#[rstest]
+fn reuse_hardlinks_keeps_each_inode_s_own_content(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    use std::{collections::BTreeMap, fs, time::SystemTime};
+
+    use rustic_core::LsOptions;
+
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    fs::create_dir(root.join("d"))?;
+    // two inodes with the same size and mtime, each hard-linked twice
+    let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    for (name, byte) in [("one", b'1'), ("two", b'2')] {
+        fs::write(root.join(name), vec![byte; 300_000])?;
+        fs::File::options()
+            .write(true)
+            .open(root.join(name))?
+            .set_modified(when)?;
+        fs::hard_link(root.join(name), root.join("d").join(format!("{name}-link")))?;
+    }
+    fs::write(root.join("single"), b"single")?;
+
+    let source = PathList::from_iter([root]);
+    let snap = repo.backup(
+        &BackupOptions::default()
+            .no_scan(true)
+            .reuse_hardlinks(true)
+            .as_path(PathBuf::from("/")),
+        &source,
+        SnapshotFile::default(),
+    )?;
+    let repo = repo.to_indexed()?;
+    let node = repo.node_from_snapshot_and_path(&snap, "")?;
+    let content: BTreeMap<String, _> = repo
+        .ls(&node, &LsOptions::default().recursive(true))?
+        .map(|item| {
+            let (path, node) = item.unwrap();
+            (path.display().to_string(), node.content)
+        })
+        .filter(|(_, content)| content.is_some())
+        .collect();
+
+    assert_eq!(content["one"], content["d/one-link"]);
+    assert_eq!(content["two"], content["d/two-link"]);
+    assert_ne!(content["one"], content["two"]);
+    assert_ne!(content["single"], content["one"]);
+    Ok(())
+}

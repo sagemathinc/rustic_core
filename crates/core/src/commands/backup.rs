@@ -176,6 +176,13 @@ pub struct BackupOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub strict: bool,
 
+    /// Read a file with several hard links only once per run: another path of
+    /// the same inode (same device, inode, size, mtime and ctime) reuses the
+    /// content already archived in this run.
+    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub reuse_hardlinks: bool,
+
     /// Metadata-only work admission before content processing.
     #[cfg_attr(feature = "clap", clap(flatten))]
     #[serde(flatten)]
@@ -298,7 +305,9 @@ where
 
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
     info!("starting to backup {backup_paths:?} ...");
-    let archiver = Archiver::new(be, index, repo.config(), parent, snap)?.strict(opts.strict);
+    let archiver = Archiver::new(be, index, repo.config(), parent, snap)?
+        .strict(opts.strict)
+        .reuse_hardlinks(opts.reuse_hardlinks);
     let p = repo.progress_bytes("backing up...");
 
     archiver.archive(

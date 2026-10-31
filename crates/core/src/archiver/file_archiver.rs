@@ -1,4 +1,10 @@
-use std::io::Read;
+use std::{
+    collections::HashMap,
+    io::Read,
+    sync::{Arc, Mutex},
+};
+
+use jiff::Timestamp;
 
 use crate::{
     archiver::{
@@ -36,6 +42,66 @@ pub(crate) struct FileArchiver<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> 
     index: &'a I,
     data_packer: Packer<BE>,
     config: ConfigFile,
+    /// Content of multiply hard-linked files archived in this run, if enabled.
+    hardlinks: Option<Arc<HardlinkCache>>,
+}
+
+/// The identity of an inode in this run: device and inode number.
+type InodeKey = (u64, u64);
+
+/// What a hard-linked file looked like when its content was archived. A path
+/// of the same inode reuses that content only if it looks exactly the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HardlinkState {
+    size: u64,
+    mtime: Timestamp,
+    ctime: Timestamp,
+}
+
+/// Content of multiply hard-linked files archived in this run.
+#[derive(Debug, Default)]
+pub(crate) struct HardlinkCache {
+    entries: Mutex<HashMap<InodeKey, (HardlinkState, Vec<DataId>)>>,
+}
+
+impl HardlinkCache {
+    /// The key and state of a node that may share its content with other paths:
+    /// a regular file with more than one link, a known inode and both times.
+    fn key_and_state(node: &Node) -> Option<(InodeKey, HardlinkState)> {
+        let meta = &node.meta;
+        if node.node_type != NodeType::File || meta.links < 2 || meta.inode == 0 {
+            return None;
+        }
+        Some((
+            (meta.device_id, meta.inode),
+            HardlinkState {
+                size: meta.size,
+                mtime: meta.mtime?,
+                ctime: meta.ctime?,
+            },
+        ))
+    }
+
+    /// The content archived in this run for this node's inode, if the node
+    /// looks exactly as it did then.
+    fn get(&self, node: &Node) -> Option<Vec<DataId>> {
+        let (key, state) = Self::key_and_state(node)?;
+        let entries = self.entries.lock().ok()?;
+        entries
+            .get(&key)
+            .filter(|(seen, _)| *seen == state)
+            .map(|(_, content)| content.clone())
+    }
+
+    /// Remember the content archived for this node's inode.
+    fn insert(&self, node: &Node) {
+        let (Some((key, state)), Some(content)) = (Self::key_and_state(node), &node.content) else {
+            return;
+        };
+        if let Ok(mut entries) = self.entries.lock() {
+            _ = entries.insert(key, (state, content.clone()));
+        }
+    }
 }
 
 impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
@@ -71,7 +137,13 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             index,
             data_packer,
             config: config.clone(),
+            hardlinks: None,
         })
+    }
+
+    /// Read each multiply hard-linked file only once in this run.
+    pub(crate) fn reuse_hardlinks(&mut self, reuse: bool) {
+        self.hardlinks = reuse.then(|| Arc::new(HardlinkCache::default()));
     }
 
     /// Processes the given item.
@@ -101,7 +173,20 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             TreeType::NewTree(item) => TreeType::NewTree(item),
             TreeType::EndTree => TreeType::EndTree,
             TreeType::Other((path, node, (open, parent))) => {
+                let reused = if matches!(parent, ParentResult::Matched(())) {
+                    None
+                } else {
+                    self.hardlinks.as_ref().and_then(|cache| cache.get(&node))
+                };
                 let (node, filesize) = if matches!(parent, ParentResult::Matched(())) {
+                    let size = node.meta.size;
+                    p.inc(size);
+                    (node, size)
+                } else if let Some(content) = reused {
+                    // Another path of this inode, unchanged since its content
+                    // was archived in this run.
+                    let mut node = node;
+                    node.content = Some(content);
                     let size = node.meta.size;
                     p.inc(size);
                     (node, size)
@@ -130,6 +215,9 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                 } else {
                     (node, 0)
                 };
+                if let Some(cache) = &self.hardlinks {
+                    cache.insert(&node);
+                }
                 TreeType::Other((path, node, (parent, filesize)))
             }
         })
@@ -198,5 +286,84 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// * If the channel could not be dropped
     pub(crate) fn finalize(self) -> RusticResult<PackerStats> {
         self.data_packer.finalize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+    use crate::backend::node::Metadata;
+
+    fn file(links: u64, inode: u64, size: u64, mtime: i64, ctime: i64) -> Node {
+        Node::new_node(
+            OsStr::new("f"),
+            NodeType::File,
+            Metadata {
+                links,
+                inode,
+                device_id: 7,
+                size,
+                mtime: Some(Timestamp::from_second(mtime).unwrap()),
+                ctime: Some(Timestamp::from_second(ctime).unwrap()),
+                ..Metadata::default()
+            },
+        )
+    }
+
+    fn archived(mut node: Node, content: &[u8]) -> Node {
+        node.content = Some(vec![DataId::from(hash(content))]);
+        node
+    }
+
+    #[test]
+    fn another_path_of_an_unchanged_inode_reuses_its_content() {
+        let cache = HardlinkCache::default();
+        cache.insert(&archived(file(2, 42, 3, 100, 200), b"abc"));
+        assert_eq!(
+            cache.get(&file(2, 42, 3, 100, 200)),
+            Some(vec![DataId::from(hash(b"abc"))])
+        );
+    }
+
+    #[test]
+    fn any_difference_reads_the_file() {
+        let cache = HardlinkCache::default();
+        cache.insert(&archived(file(2, 42, 3, 100, 200), b"abc"));
+        for other in [
+            file(2, 43, 3, 100, 200), // another inode
+            file(2, 42, 4, 100, 200), // size changed
+            file(2, 42, 3, 101, 200), // mtime changed
+            file(2, 42, 3, 100, 201), // ctime changed
+        ] {
+            assert_eq!(cache.get(&other), None);
+        }
+        let mut other_device = file(2, 42, 3, 100, 200);
+        other_device.meta.device_id = 8;
+        assert_eq!(cache.get(&other_device), None);
+    }
+
+    #[test]
+    fn only_multiply_linked_regular_files_with_known_identity_take_part() {
+        let cache = HardlinkCache::default();
+        for node in [
+            file(1, 42, 3, 100, 200), // a single link
+            file(2, 0, 3, 100, 200),  // unknown inode
+        ] {
+            cache.insert(&archived(node.clone(), b"abc"));
+            assert_eq!(cache.get(&node), None);
+        }
+        let mut no_ctime = file(2, 42, 3, 100, 200);
+        no_ctime.meta.ctime = None;
+        cache.insert(&archived(no_ctime.clone(), b"abc"));
+        assert_eq!(cache.get(&no_ctime), None);
+        let mut dir = file(2, 44, 3, 100, 200);
+        dir.node_type = NodeType::Dir;
+        cache.insert(&archived(dir.clone(), b"abc"));
+        assert_eq!(cache.get(&dir), None);
+        // a node without content (not archived) is not remembered
+        cache.insert(&file(2, 45, 3, 100, 200));
+        assert_eq!(cache.get(&file(2, 45, 3, 100, 200)), None);
     }
 }
