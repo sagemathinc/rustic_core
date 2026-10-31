@@ -292,18 +292,23 @@ fn noise(len: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The chunker's largest chunk (`DEFAULT_CHUNK_MAX_SIZE`).  Chunk boundaries
+/// depend on the repository's random polynomial, so only this bound is fixed.
+const MAX_CHUNK: usize = 8 * 1024 * 1024;
+
 /// Three paths of one inode; whichever path owns the read fails (slowly, so
-/// the other two are waiting), either at open or partway through reading,
-/// after some blobs were already written.  The waiters must read the file
-/// themselves and get all of it; nothing partial may be published.
+/// the other two are waiting), either at open or partway through reading.  At
+/// 2.5 chunk maxima in, at least two blobs are already written whatever the
+/// polynomial.  The waiters must read the file themselves and get all of it;
+/// nothing partial may be published.
 #[rstest]
 #[case::at_open(None)]
-#[case::mid_read(Some(2 * 1024 * 1024))]
+#[case::mid_read(Some((5 * MAX_CHUNK / 2) as u64))]
 fn owner_read_failure_gives_waiters_their_own_read(
     set_up_repo: Result<RepoOpen>,
     #[case] fail_after: Option<u64>,
 ) -> Result<()> {
-    let bytes = noise(3 * 1024 * 1024 + 17);
+    let bytes = noise(3 * MAX_CHUNK + 17);
     let mut source = Source::new(vec![
         path("a", 5, 3, &bytes).slow(),
         path("b", 5, 3, &bytes).slow(),
@@ -321,7 +326,16 @@ fn owner_read_failure_gives_waiters_their_own_read(
     assert_eq!(run.snapshot.summary.as_ref().unwrap().error_count, 1);
     assert_eq!(run.contents.len(), 2, "only the failed path is missing");
     let ids: Vec<_> = run.contents.values().collect();
-    assert!(ids[0].len() > 1, "a waiter got empty or partial content");
+    // at least ceil(len / MAX_CHUNK) blobs whatever the polynomial; the
+    // comparison with a plain read below is the exact check
+    assert!(
+        ids[0].len() >= bytes.len().div_ceil(MAX_CHUNK),
+        "a waiter got empty or partial content: {:?}",
+        run.contents
+            .iter()
+            .map(|(k, v)| (k, v.len()))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(ids[0], ids[1]);
     // and it is the real content: the same as a plain read of the bytes
     let (_, plain) = archive(
