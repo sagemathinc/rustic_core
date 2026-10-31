@@ -152,6 +152,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * If sending the message to the raw packer fails.
     /// * If the index file could not be serialized.
     /// * If the time is not in the range of `Local::now()`.
+    #[allow(clippy::too_many_lines)]
     pub fn archive<R>(
         mut self,
         src: &R,

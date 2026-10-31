@@ -66,29 +66,38 @@ enum Slot {
     Reading(HardlinkState, Arc<Pending>),
 }
 
+/// The state of a read that other paths wait for.
+#[derive(Debug, Default)]
+enum Outcome {
+    #[default]
+    Reading,
+    /// The archived content, or `None` if the read failed.
+    Finished(Option<Vec<DataId>>),
+}
+
 /// A read in progress that other paths of the same inode wait for.
 #[derive(Debug, Default)]
 struct Pending {
-    /// `None` while reading; then `Some(Some(content))`, or `Some(None)` if
-    /// the read failed.
-    outcome: Mutex<Option<Option<Vec<DataId>>>>,
+    outcome: Mutex<Outcome>,
     finished: Condvar,
 }
 
 impl Pending {
     fn wait(&self) -> Option<Vec<DataId>> {
         let mut outcome = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-        while outcome.is_none() {
+        loop {
+            if let Outcome::Finished(content) = &*outcome {
+                return content.clone();
+            }
             outcome = self
                 .finished
                 .wait(outcome)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        outcome.clone().flatten()
     }
 
     fn finish(&self, content: Option<Vec<DataId>>) {
-        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(content);
+        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Outcome::Finished(content);
         self.finished.notify_all();
     }
 }
@@ -169,24 +178,29 @@ impl HardlinkCache {
         let Some((key, state)) = Self::key_and_state(node) else {
             return Claim::Read;
         };
-        let pending = {
-            let mut slots = self.slots();
-            match slots.get(&key) {
-                Some(Slot::Done(seen, content)) if *seen == state => {
-                    return Claim::Reuse(content.clone());
-                }
-                Some(Slot::Reading(seen, pending)) if *seen == state => Arc::clone(pending),
-                _ => {
-                    let pending = Arc::new(Pending::default());
-                    _ = slots.insert(key, Slot::Reading(state.clone(), Arc::clone(&pending)));
-                    return Claim::Own(OwnedRead {
-                        cache: self,
-                        key,
-                        state,
-                        pending,
-                        finished: false,
-                    });
-                }
+        let mut slots = self.slots();
+        let pending = match slots.get(&key) {
+            Some(Slot::Done(seen, content)) if *seen == state => {
+                let content = content.clone();
+                drop(slots);
+                return Claim::Reuse(content);
+            }
+            Some(Slot::Reading(seen, pending)) if *seen == state => {
+                let pending = Arc::clone(pending);
+                drop(slots);
+                pending
+            }
+            _ => {
+                let pending = Arc::new(Pending::default());
+                _ = slots.insert(key, Slot::Reading(state.clone(), Arc::clone(&pending)));
+                drop(slots);
+                return Claim::Own(OwnedRead {
+                    cache: self,
+                    key,
+                    state,
+                    pending,
+                    finished: false,
+                });
             }
         };
         pending.wait().map_or(Claim::Read, Claim::Reuse)
@@ -203,15 +217,15 @@ impl HardlinkCache {
     ) {
         {
             let mut slots = self.slots();
-            if let Some(Slot::Reading(_, current)) = slots.get(&key) {
-                if Arc::ptr_eq(current, pending) {
-                    match &content {
-                        Some(content) => {
-                            _ = slots.insert(key, Slot::Done(state.clone(), content.clone()));
-                        }
-                        None => {
-                            _ = slots.remove(&key);
-                        }
+            if let Some(Slot::Reading(_, current)) = slots.get(&key)
+                && Arc::ptr_eq(current, pending)
+            {
+                match &content {
+                    Some(content) => {
+                        _ = slots.insert(key, Slot::Done(state.clone(), content.clone()));
+                    }
+                    None => {
+                        _ = slots.remove(&key);
                     }
                 }
             }

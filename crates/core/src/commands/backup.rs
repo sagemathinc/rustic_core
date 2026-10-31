@@ -146,6 +146,7 @@ impl ParentOptions {
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 #[setters(into)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)]
 /// Options for the `backup` command.
 pub struct BackupOptions {
     /// Set filename to be used when backing up from stdin
