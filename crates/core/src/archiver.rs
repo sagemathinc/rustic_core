@@ -14,7 +14,9 @@ use pariter::IteratorExt;
 use crate::{
     Progress,
     archiver::{
-        file_archiver::FileArchiver, parent::Parent, tree::TreeIterator,
+        file_archiver::FileArchiver,
+        parent::{Parent, ParentResult},
+        tree::{TreeIterator, TreeType},
         tree_archiver::TreeArchiver,
     },
     backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
@@ -120,6 +122,14 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         self
     }
 
+    /// Read each multiply hard-linked file only once in this run (see
+    /// `BackupOptions::reuse_hardlinks`).
+    #[must_use]
+    pub fn reuse_hardlinks(mut self, reuse: bool) -> Self {
+        self.file_archiver.reuse_hardlinks(reuse);
+        self
+    }
+
     /// Archives the given source.
     ///
     /// This will archive all files and trees in the given source.
@@ -142,6 +152,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * If sending the message to the raw packer fails.
     /// * If the index file could not be serialized.
     /// * If the time is not in the range of `Local::now()`.
+    #[allow(clippy::too_many_lines)]
     pub fn archive<R>(
         mut self,
         src: &R,
@@ -158,6 +169,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     {
         let incomplete = AtomicBool::new(false);
         let error_count = AtomicU64::new(0);
+        let hardlinks = self.file_archiver.hardlink_cache();
 
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
@@ -214,7 +226,22 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             // use parent snapshot
             iter.filter_map(
                 |item| match self.parent.process(&self.be, self.index, item) {
-                    Ok(item) => Some(item),
+                    Ok(item) => {
+                        // Seed the hard-link cache here, in order, before any
+                        // later path of the same inode reaches a worker. Only
+                        // a match that compared device, inode and ctime vouches
+                        // for the inode's other paths; a weaker one (e.g. with
+                        // --ignore-ctime) vouches for this path only.
+                        if let (
+                            Some(cache),
+                            TreeType::Other((_, node, (_, ParentResult::Matched(())))),
+                        ) = (&hardlinks, &item)
+                            && self.parent.last_match_vouches_for_inode()
+                        {
+                            cache.seed(node);
+                        }
+                        Some(item)
+                    }
                     Err(err) => {
                         incomplete.store(true, Ordering::Relaxed);
                         warn!("ignoring error reading parent snapshot: {err:?}");

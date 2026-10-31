@@ -32,6 +32,9 @@ pub struct Parent {
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
     ignore_inode: bool,
+    /// Whether the last file processed matched a parent node that also has
+    /// its device, inode number and ctime (see [`Parent::vouches_for_inode`]).
+    last_match_vouches_for_inode: bool,
 }
 
 /// The result of a parent search.
@@ -113,7 +116,35 @@ impl Parent {
             stack: Vec::new(),
             ignore_ctime,
             ignore_inode,
+            last_match_vouches_for_inode: false,
         }
+    }
+
+    /// Whether a matched parent node proves the content of the inode itself,
+    /// not only of this path: the device, the inode number and the ctime were
+    /// all present on both sides, compared and equal. A match that ignored
+    /// ctime or inode (by option, or because one side lacks them) only vouches
+    /// for this path.
+    fn vouches_for_inode(
+        ignore_ctime: bool,
+        ignore_inode: bool,
+        p_node: &Node,
+        node: &Node,
+    ) -> bool {
+        let (p_meta, meta) = (&p_node.meta, &node.meta);
+        !ignore_ctime
+            && !ignore_inode
+            && p_meta.inode != 0
+            && p_meta.inode == meta.inode
+            && p_meta.device_id == meta.device_id
+            && p_meta.ctime.is_some()
+            && p_meta.ctime == meta.ctime
+    }
+
+    /// Whether the last file passed to [`Parent::process`] matched its parent
+    /// node strongly enough to vouch for every path of its inode.
+    pub(crate) const fn last_match_vouches_for_inode(&self) -> bool {
+        self.last_match_vouches_for_inode
     }
 
     /// Returns the parent node with the given name.
@@ -288,10 +319,14 @@ impl Parent {
                 TreeType::EndTree
             }
             TreeType::Other((path, mut node, open)) => {
+                let (ignore_ctime, ignore_inode) = (self.ignore_ctime, self.ignore_inode);
+                let mut vouches = false;
                 let parent = self.is_parent(&node, &node.name());
                 let parent = match parent {
                     ParentResult::Matched(p_node) => {
                         if p_node.content.iter().flatten().all(|id| index.has_data(id)) {
+                            vouches =
+                                Self::vouches_for_inode(ignore_ctime, ignore_inode, p_node, &node);
                             node.content.clone_from(&p_node.content);
                             ParentResult::Matched(())
                         } else {
@@ -304,6 +339,7 @@ impl Parent {
                     }
                     parent_result => parent_result.map(|_| ()),
                 };
+                self.last_match_vouches_for_inode = vouches;
                 TreeType::Other((path, node, (open, parent)))
             }
         };
@@ -342,10 +378,46 @@ mod tests {
             stack: Vec::new(),
             ignore_ctime: false,
             ignore_inode,
+            last_match_vouches_for_inode: false,
         };
 
         let result = parent.is_parent(&file_with_inode(2), OsStr::new("file"));
 
         assert_eq!(matches!(result, ParentResult::Matched(_)), expected_match);
+    }
+
+    fn file_with(device_id: u64, inode: u64, ctime: Option<i64>) -> Node {
+        let meta = Metadata {
+            device_id,
+            inode,
+            ctime: ctime.map(|s| jiff::Timestamp::from_second(s).unwrap()),
+            ..Metadata::default()
+        };
+        Node::new_node(OsStr::new("file"), NodeType::File, meta)
+    }
+
+    #[rstest]
+    #[case::all_equal(false, false, (1, 5, Some(9)), (1, 5, Some(9)), true)]
+    #[case::ignore_ctime(true, false, (1, 5, Some(9)), (1, 5, Some(9)), false)]
+    #[case::ignore_inode(false, true, (1, 5, Some(9)), (1, 5, Some(9)), false)]
+    #[case::parent_inode_zero(false, false, (1, 0, Some(9)), (1, 0, Some(9)), false)]
+    #[case::inode_differs(false, false, (1, 5, Some(9)), (1, 6, Some(9)), false)]
+    #[case::device_differs(false, false, (1, 5, Some(9)), (2, 5, Some(9)), false)]
+    #[case::ctime_missing(false, false, (1, 5, None), (1, 5, None), false)]
+    #[case::parent_ctime_missing(false, false, (1, 5, None), (1, 5, Some(9)), false)]
+    #[case::ctime_differs(false, false, (1, 5, Some(9)), (1, 5, Some(10)), false)]
+    fn only_a_full_identity_match_vouches_for_the_inode(
+        #[case] ignore_ctime: bool,
+        #[case] ignore_inode: bool,
+        #[case] parent: (u64, u64, Option<i64>),
+        #[case] current: (u64, u64, Option<i64>),
+        #[case] expected: bool,
+    ) {
+        let p_node = file_with(parent.0, parent.1, parent.2);
+        let node = file_with(current.0, current.1, current.2);
+        assert_eq!(
+            Parent::vouches_for_inode(ignore_ctime, ignore_inode, &p_node, &node),
+            expected
+        );
     }
 }
