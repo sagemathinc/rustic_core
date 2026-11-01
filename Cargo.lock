@@ -4121,6 +4121,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustic_extents"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rustic_testing"
 version = "0.5.0"
 dependencies = [
