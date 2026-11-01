@@ -1,10 +1,12 @@
 use std::{
     cmp::Ordering,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
 };
 
 use jiff::Timestamp;
-use log::warn;
+use log::{info, warn};
+use smallvec::SmallVec;
 
 use crate::{
     archiver::{TreeStackEmptyError, tree::TreeType},
@@ -25,10 +27,10 @@ pub(crate) type ItemWithParent<O> = TreeType<(O, ParentResult<()>), ParentResult
 pub struct Parent {
     /// The tree id of the parent tree.
     tree_ids: Vec<TreeId>,
-    /// The parent tree.
-    trees: Vec<(Tree, usize)>,
+    /// The parent trees of the current directory.
+    trees: Vec<ParentTree>,
     /// The stack of parent trees.
-    stack: Vec<Vec<(Tree, usize)>>,
+    stack: Vec<Vec<ParentTree>>,
     /// Ignore ctime when comparing nodes.
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
@@ -37,8 +39,27 @@ pub struct Parent {
     /// this cutoff were written by the restore (see
     /// `ParentOptions::restored_before`).
     restored_before: Option<Timestamp>,
+    /// Find a moved directory's parent trees by its inode (see
+    /// `ParentOptions::detect_moves`).
+    detect_moves: bool,
+    /// The most entries (directories indexed plus trees visited) the
+    /// directory index may hold; above it, move detection is off.
+    detect_moves_max_entries: usize,
+    /// The parent trees' directories by inode, built on first use (empty if
+    /// it would have exceeded `detect_moves_max_entries`).
+    dir_inodes: Option<HashMap<u64, SmallVec<[TreeId; 1]>>>,
     /// What the last file processed was vouched for by its parent match.
     last_vouch: Vouch,
+}
+
+/// A parent tree of the current directory, with the position reached in it.
+#[derive(Debug)]
+struct ParentTree {
+    tree: Tree,
+    idx: usize,
+    /// Found by a directory's inode, not at its path (or below such a tree):
+    /// its nodes match only with full identity (see [`Parent::is_parent`]).
+    moved: bool,
 }
 
 /// What a parent match vouches for, beyond its own path (ordered: an inode
@@ -107,6 +128,8 @@ impl Parent {
     /// * `ignore_inode` - Ignore inode number when comparing nodes.
     /// * `restored_before` - The source was restored from this parent, and
     ///   files with a ctime before this cutoff were written by the restore.
+    /// * `detect_moves` - Find a moved directory's parent trees by its inode,
+    ///   with at most this many entries in the directory index.
     pub(crate) fn new(
         be: &impl DecryptReadBackend,
         index: &impl ReadGlobalIndex,
@@ -114,12 +137,20 @@ impl Parent {
         ignore_ctime: bool,
         ignore_inode: bool,
         restored_before: Option<Timestamp>,
+        detect_moves: Option<usize>,
     ) -> Self {
         // if tree_id is given, try to load tree from backend.
         let (trees, tree_ids) = tree_id
             .into_iter()
             .filter_map(|tree_id| match Tree::from_backend(be, index, tree_id) {
-                Ok(tree) => Some(((tree, 0), tree_id)),
+                Ok(tree) => Some((
+                    ParentTree {
+                        tree,
+                        idx: 0,
+                        moved: false,
+                    },
+                    tree_id,
+                )),
                 Err(err) => {
                     warn!(
                         "ignoring error when loading parent tree {tree_id:?}: {}",
@@ -137,6 +168,9 @@ impl Parent {
             ignore_ctime,
             ignore_inode,
             restored_before,
+            detect_moves: detect_moves.is_some(),
+            detect_moves_max_entries: detect_moves.unwrap_or_default(),
+            dir_inodes: None,
             last_vouch: Vouch::Nothing,
         }
     }
@@ -151,6 +185,66 @@ impl Parent {
         self.restored_before
             .zip(node.meta.ctime)
             .is_some_and(|(restored_before, ctime)| ctime < restored_before)
+    }
+
+    /// Maps the inode of every directory in the parent trees to its subtrees
+    /// (several, if several parents have a directory with that inode). Trees
+    /// that can't be loaded are skipped with a warning. Returns `None` once the
+    /// subtrees indexed plus the trees visited exceed `max_entries`: the
+    /// partial index is dropped.
+    fn dir_inode_map(
+        be: &impl DecryptReadBackend,
+        index: &impl ReadGlobalIndex,
+        roots: &[TreeId],
+        max_entries: usize,
+    ) -> Option<HashMap<u64, SmallVec<[TreeId; 1]>>> {
+        let mut map: HashMap<u64, SmallVec<[TreeId; 1]>> = HashMap::new();
+        let mut seen: HashSet<TreeId> = HashSet::new();
+        let mut entries = 0_usize;
+        let mut count = || {
+            entries += 1;
+            (entries <= max_entries).then_some(())
+        };
+        let mut todo = Vec::new();
+        for root in roots {
+            if seen.insert(*root) {
+                count()?;
+                todo.push(*root);
+            }
+        }
+        while let Some(tree_id) = todo.pop() {
+            let tree = match Tree::from_backend(be, index, tree_id) {
+                Ok(tree) => tree,
+                Err(err) => {
+                    warn!(
+                        "detect-moves: ignoring parent tree {tree_id}: {}",
+                        err.display_log()
+                    );
+                    continue;
+                }
+            };
+            for node in tree.nodes {
+                let Some(subtree) = node.subtree.filter(|_| node.is_dir()) else {
+                    continue;
+                };
+                if node.meta.inode != 0 {
+                    let subtrees = map.entry(node.meta.inode).or_default();
+                    if !subtrees.contains(&subtree) {
+                        count()?;
+                        subtrees.push(subtree);
+                    }
+                }
+                if seen.insert(subtree) {
+                    count()?;
+                    todo.push(subtree);
+                }
+            }
+        }
+        info!(
+            "detect-moves: indexed {} parent directories by inode ({entries} entries)",
+            map.len()
+        );
+        Some(map)
     }
 
     /// Whether a matched parent node is strong evidence that the file still
@@ -221,16 +315,16 @@ impl Parent {
     /// # Returns
     ///
     /// The parent node with the given name, or `None` if the parent node is not found.
-    fn p_node(&mut self, name: &OsStr) -> impl Iterator<Item = &Node> {
-        self.trees.iter_mut().filter_map(|(tree, idx)| {
-            let p_nodes = &tree.nodes;
+    fn p_node(&mut self, name: &OsStr) -> impl Iterator<Item = (&Node, bool)> {
+        self.trees.iter_mut().filter_map(|parent| {
+            let p_nodes = &parent.tree.nodes;
             loop {
-                match p_nodes.get(*idx) {
+                match p_nodes.get(parent.idx) {
                     None => break None,
                     Some(p_node) => match (*p_node.name()).cmp(name) {
-                        Ordering::Less => *idx += 1,
+                        Ordering::Less => parent.idx += 1,
                         Ordering::Equal => {
-                            break Some(p_node);
+                            break Some((p_node, parent.moved));
                         }
                         Ordering::Greater => {
                             break None;
@@ -252,6 +346,12 @@ impl Parent {
     ///
     /// Whether the given node is the parent of the given tree.
     ///
+    /// A node of a moved tree (found by a directory's inode, not at its path)
+    /// matches only with full identity, whatever the options: type, size and
+    /// mtime equal, and [`Parent::vouches_for_content`] without ignoring
+    /// anything (nonzero equal inode, present equal ctime). Path identity no
+    /// longer backs it, so no relaxation applies.
+    ///
     /// # Note
     ///
     /// TODO: This function does not check whether the given node is a directory.
@@ -267,9 +367,15 @@ impl Parent {
         }
 
         p_node
-            .find(|p_node| {
+            .find(|(p_node, moved)| {
                 let p_meta = &p_node.meta;
                 let meta = &node.meta;
+                if *moved {
+                    return p_node.node_type == node.node_type
+                        && p_meta.size == meta.size
+                        && p_meta.mtime == meta.mtime
+                        && Self::vouches_for_content(false, false, p_node, node);
+                }
 
                 let match_ctime =
                     ignore_ctime || p_meta.ctime.zip(meta.ctime).is_none_or(|(x, y)| x == y);
@@ -284,7 +390,9 @@ impl Parent {
                     && match_ctime
                     && match_inode
             })
-            .map_or(ParentResult::NotMatched, ParentResult::Matched)
+            .map_or(ParentResult::NotMatched, |(p_node, _)| {
+                ParentResult::Matched(p_node)
+            })
     }
 
     // TODO: add documentation!
@@ -302,33 +410,62 @@ impl Parent {
         be: &impl DecryptReadBackend,
         index: &impl ReadGlobalIndex,
         name: &OsStr,
+        node: &Node,
     ) {
-        let mut new_ids: Vec<_> = self
+        let mut same_inode = false;
+        // (subtree, moved): a subtree of a moved tree is moved too
+        let mut new_ids: Vec<(TreeId, bool)> = self
             .p_node(name)
-            .filter_map(|p_node| {
-                p_node.subtree.or_else(|| {
+            .filter_map(|(p_node, moved)| {
+                same_inode |= node.meta.inode != 0 && p_node.meta.inode == node.meta.inode;
+                p_node.subtree.map(|id| (id, moved)).or_else(|| {
                     warn!("ignoring parent node {}: is no tree!", p_node.name);
                     None
                 })
             })
             .collect();
 
-        // remove potentially identical trees
+        // A directory that is not at its parent's path (moved or renamed, or
+        // new) also gets the parent trees of the directory with its inode, as
+        // moved trees: their files match only with full identity.
+        if self.detect_moves && node.meta.inode != 0 && !same_inode {
+            let (roots, max_entries) = (&self.tree_ids, self.detect_moves_max_entries);
+            let moved = self
+                .dir_inodes
+                .get_or_insert_with(|| {
+                    Self::dir_inode_map(be, index, roots, max_entries).unwrap_or_else(|| {
+                        warn!(
+                            "detect-moves: off for this backup, the parent snapshot needs more than {max_entries} index entries"
+                        );
+                        HashMap::new()
+                    })
+                })
+                .get(&node.meta.inode);
+            new_ids.extend(moved.into_iter().flatten().map(|id| (*id, true)));
+        }
+
+        // remove potentially identical trees; one reached by path wins
         new_ids.sort();
-        new_ids.dedup();
+        new_ids.dedup_by_key(|(id, _)| *id);
 
         let new_tree = new_ids
             .into_iter()
-            .filter_map(|tree_id| match Tree::from_backend(be, index, tree_id) {
-                Ok(tree) => Some((tree, 0)),
-                Err(err) => {
-                    warn!(
-                        "ignoring error when loading parent tree {tree_id}: {}",
-                        err.display_log()
-                    );
-                    None
-                }
-            })
+            .filter_map(
+                |(tree_id, moved)| match Tree::from_backend(be, index, tree_id) {
+                    Ok(tree) => Some(ParentTree {
+                        tree,
+                        idx: 0,
+                        moved,
+                    }),
+                    Err(err) => {
+                        warn!(
+                            "ignoring error when loading parent tree {tree_id}: {}",
+                            err.display_log()
+                        );
+                        None
+                    }
+                },
+            )
             .collect();
         let old_tree = std::mem::replace(&mut self.trees, new_tree);
         self.stack.push(old_tree);
@@ -377,7 +514,7 @@ impl Parent {
                 let parent_result = self
                     .is_parent(&node, &tree)
                     .map(|node| node.subtree.unwrap());
-                self.set_dir(be, index, &tree);
+                self.set_dir(be, index, &tree, &node);
                 TreeType::NewTree((path, node, parent_result))
             }
             TreeType::EndTree => {
@@ -455,11 +592,18 @@ mod tests {
         };
         let mut parent = Parent {
             tree_ids: Vec::new(),
-            trees: vec![(parent_tree, 0)],
+            trees: vec![ParentTree {
+                tree: parent_tree,
+                idx: 0,
+                moved: false,
+            }],
             stack: Vec::new(),
             ignore_ctime: false,
             ignore_inode,
             restored_before: None,
+            detect_moves: false,
+            detect_moves_max_entries: 0,
+            dir_inodes: None,
             last_vouch: Vouch::Nothing,
         };
 
