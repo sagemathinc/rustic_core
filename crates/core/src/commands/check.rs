@@ -230,7 +230,9 @@ pub(crate) fn check_repository<S: Open>(
     let be = repo.dbe();
     let cache = repo.cache();
     let hot_be = &repo.be_hot;
-    let raw_be = repo.dbe();
+    // The repository itself, not through the cache: comparing the cache
+    // against the cached backend would compare the cache with itself.
+    let raw_be = repo.uncached_be();
     let collector = CheckResultsCollector::default().log(true);
     if !opts.trust_cache
         && let Some(cache) = &cache

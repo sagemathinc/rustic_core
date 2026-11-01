@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::{
     BlobId, RusticResult,
-    backend::{cache::Cache, decrypt::DecryptBackend},
+    backend::{WriteBackend, cache::Cache, decrypt::DecryptBackend},
     crypto::aespoly1305::Key,
     index::GlobalIndex,
     repofile::{ConfigFile, KeyId},
@@ -66,6 +68,10 @@ pub struct OpenStatus {
     pub(super) config: ConfigFile,
     /// The [`KeyId`] of the used key
     pub(super) key_id: Option<KeyId>,
+    /// The backend without the cache: what is really in the repository.
+    /// `check` compares the cache against it; reading through the cached
+    /// backend would compare the cache with itself.
+    pub(super) uncached_be: Arc<dyn WriteBackend>,
 }
 
 impl Open for OpenStatus {
