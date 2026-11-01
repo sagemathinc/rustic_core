@@ -35,6 +35,7 @@ mod integration {
     mod hotcold;
     mod key;
     mod ls;
+    mod moves;
     mod prune;
     mod repair_snapshots;
     mod restore;

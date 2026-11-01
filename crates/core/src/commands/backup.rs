@@ -105,6 +105,35 @@ pub struct ParentOptions {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub restored_before: Option<Timestamp>,
+
+    /// Find the parent of a moved or renamed directory by its inode: a
+    /// directory that has no parent directory with its inode at its path also
+    /// looks for its files in the parent directory with that inode. Such a file
+    /// must match with full identity, whatever the other options: type, size,
+    /// mtime, nonzero equal inode and equal ctime. So only unchanged files are
+    /// found at their new path. A renamed file itself gets a new ctime, so
+    /// only files inside a moved directory are found. On first use this loads
+    /// every tree of the parent snapshot into an index of directories.
+    ///
+    /// Inode numbers identify a directory only within one filesystem (or
+    /// btrfs subvolume), so this needs `--one-file-system` and exactly one
+    /// backup path, and every parent must have been made the same way of the
+    /// same path (recorded in the snapshot as `single_filesystem`; snapshots
+    /// of older versions don't have it). Otherwise it is ignored with a
+    /// warning. With a custom `ReadSource` (`Repository::archive`), setting
+    /// `--one-file-system` is the caller's assertion that the source stays
+    /// within one filesystem.
+    #[cfg_attr(feature = "clap", clap(long, conflicts_with = "force"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub detect_moves: bool,
+
+    /// The most entries (parent directories indexed plus trees visited) the
+    /// `--detect-moves` index may hold [default: 1000000]. A parent snapshot
+    /// that needs more turns move detection off for the backup, with a
+    /// warning; files are then matched at their own path only.
+    #[cfg_attr(feature = "clap", clap(long, value_name = "N"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
+    pub detect_moves_max_entries: Option<usize>,
 }
 
 /// How long before `--restored-before` a file's ctime must be.
@@ -113,6 +142,10 @@ pub struct ParentOptions {
 /// timer tick of coarse kernel timestamps (up to 10 ms), with room for clock
 /// uncertainty.
 pub const RESTORED_BEFORE_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_secs(2);
+
+/// The default of `ParentOptions::detect_moves_max_entries`: about 100 MB
+/// of index at most.
+pub const DETECT_MOVES_MAX_ENTRIES: usize = 1_000_000;
 
 impl ParentOptions {
     /// Fails if [`ParentOptions::restored_before`] is in the future: every
@@ -191,6 +224,19 @@ impl ParentOptions {
             .unwrap_or_default()
         };
 
+        // Inode numbers identify a directory only within one filesystem, and
+        // a parent of another tree has unrelated ones: move detection needs
+        // this snapshot and every parent to be single-filesystem sources of
+        // the same paths.
+        let detect_moves_ok = snap.single_filesystem
+            && parent
+                .iter()
+                .all(|parent| parent.single_filesystem && parent.paths == snap.paths);
+        if self.detect_moves && !detect_moves_ok {
+            warn!(
+                "ignoring --detect-moves: it needs --one-file-system, one backup path, and parents made the same way of the same path"
+            );
+        }
         let (parent_trees, parent_ids): (Vec<_>, _) = parent
             .into_iter()
             .map(|parent| (parent.tree, parent.id))
@@ -205,6 +251,10 @@ impl ParentOptions {
                 self.ignore_ctime,
                 self.ignore_inode,
                 self.restored_cutoff(),
+                (self.detect_moves && detect_moves_ok).then(|| {
+                    self.detect_moves_max_entries
+                        .unwrap_or(DETECT_MOVES_MAX_ENTRIES)
+                }),
             ),
         )
     }
@@ -373,6 +423,13 @@ where
                 .join(","),
         )
     })?;
+
+    // Inode numbers identify a directory only within one filesystem (or btrfs
+    // subvolume): record whether this source is one path read without
+    // leaving its filesystem, as move detection requires of the snapshot and
+    // of its parents. For a custom source, `--one-file-system` is the
+    // caller's assertion that it stays within one filesystem.
+    snap.single_filesystem = opts.ignore_filter_opts.one_file_system && backup_paths.len() == 1;
 
     opts.parent_opts.validate()?;
     let (parent_ids, parent) = opts.parent_opts.get_parent(repo, &snap);

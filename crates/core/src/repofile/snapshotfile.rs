@@ -407,6 +407,13 @@ pub struct SnapshotFile {
     #[serde(default)]
     pub tags: StringList,
 
+    /// The source was a single path read without leaving its filesystem
+    /// (`--one-file-system`), so an inode number identifies one directory in
+    /// it. A parent must have this for `--detect-moves`. Not written by
+    /// older versions, which read as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_filesystem: bool,
+
     /// The original Id of this snapshot. This is stored when the snapshot is modified.
     pub original: Option<SnapshotId>,
 
@@ -444,6 +451,7 @@ impl Default for SnapshotFile {
             uid: Default::default(),
             gid: Default::default(),
             tags: StringList::default(),
+            single_filesystem: false,
             original: Option::default(),
             delete: DeleteOption::default(),
             summary: Option::default(),
