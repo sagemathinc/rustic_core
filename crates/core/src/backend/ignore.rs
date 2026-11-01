@@ -331,13 +331,12 @@ pub struct LocalSourceWalker {
     strict_metadata: bool,
     /// The device of the backup root being walked.
     root_dev: RootDevice,
-    /// A walk item held back while an error about its backup root is
-    /// returned first (the end of the walk needs no holding back: the walker
-    /// keeps returning `None`).
+    /// A file backup root held back while the error about reading its
+    /// metadata is returned first.
     pending: Option<Result<ignore::DirEntry, ignore::Error>>,
-    /// Tests only: reading a backup root's metadata fails.
+    /// Tests only: reading the metadata of these backup roots fails.
     #[cfg(test)]
-    fail_root_metadata: bool,
+    fail_root_metadata: Vec<PathBuf>,
 }
 
 impl LocalSourceWalker {
@@ -349,7 +348,7 @@ impl LocalSourceWalker {
             root_dev: RootDevice::NoDevices,
             pending: None,
             #[cfg(test)]
-            fail_root_metadata: false,
+            fail_root_metadata: Vec::new(),
         }
     }
 
@@ -414,26 +413,18 @@ impl LocalSourceWalker {
         })
     }
 
-    /// Enters a backup root if `item` is one; returns the error about it, if
-    /// any.
-    fn check_root(
-        &mut self,
-        item: Option<&Result<ignore::DirEntry, ignore::Error>>,
-    ) -> Option<Box<RusticError>> {
-        match item {
-            Some(Ok(entry)) if entry.depth() == 0 => {
-                let path = entry.path().to_path_buf();
-                let metadata = entry.metadata().map_err(|err| err.to_string());
-                #[cfg(test)]
-                let metadata = if self.fail_root_metadata {
-                    Err("injected".to_string())
-                } else {
-                    metadata
-                };
-                self.enter_root(&path, metadata)
-            }
-            _ => None,
-        }
+    /// Enters a backup root (an entry of depth 0); returns the error about
+    /// reading its metadata, if any.
+    fn check_root(&mut self, entry: &ignore::DirEntry) -> Option<Box<RusticError>> {
+        let path = entry.path().to_path_buf();
+        let metadata = entry.metadata().map_err(|err| err.to_string());
+        #[cfg(test)]
+        let metadata = if self.fail_root_metadata.contains(&path) {
+            Err("injected".to_string())
+        } else {
+            metadata
+        };
+        self.enter_root(&path, metadata)
     }
 }
 
@@ -441,25 +432,33 @@ impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // a file root whose error was just returned: the file itself, with
+        // that root's (unknown) device
         if let Some(item) = self.pending.take() {
             return self.map_item(Some(item));
         }
-        let mut item = self.walker.next();
-        // a backup root (depth 0) sets the device its entries are compared with
-        let mut root_err = self.check_root(item.as_ref());
-        // ignore root dir, i.e. an entry with depth 0 of type dir
-        if let Some(Ok(entry)) = &item
-            && entry.depth() == 0
-            && entry.file_type().unwrap().is_dir()
-        {
-            item = self.walker.next();
-            root_err = self.check_root(item.as_ref()).or(root_err);
+        loop {
+            let item = self.walker.next();
+            let Some(Ok(entry)) = &item else {
+                return self.map_item(item);
+            };
+            if entry.depth() != 0 {
+                return self.map_item(item);
+            }
+            // A backup root sets the device its entries are compared with. A
+            // directory root is not an entry itself (it is skipped); a file
+            // root is.
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            if let Some(err) = self.check_root(entry) {
+                if !is_dir {
+                    self.pending = item;
+                }
+                return Some(Err(err));
+            }
+            if !is_dir {
+                return self.map_item(item);
+            }
         }
-        if let Some(err) = root_err {
-            self.pending = item;
-            return Some(Err(err));
-        }
-        self.map_item(item)
     }
 }
 
@@ -467,16 +466,18 @@ impl Iterator for LocalSourceWalker {
 mod root_device_walk_tests {
     use super::*;
 
-    fn walk(dir: &Path, fail_root_metadata: bool) -> Vec<Result<(String, bool), String>> {
+    /// Walk these backup roots, reading the metadata of `failing` roots
+    /// fails; return each item as (name, marked) or the error.
+    fn walk(roots: &[&Path], failing: &[&Path]) -> Vec<Result<(String, bool), String>> {
         let source = LocalSource::new(
             LocalSourceSaveOptions::default(),
             &Excludes::default(),
             &LocalSourceFilterOptions::default(),
-            &[dir],
+            roots,
         )
         .unwrap();
         let mut walker = source.entries();
-        walker.fail_root_metadata = fail_root_metadata;
+        walker.fail_root_metadata = failing.iter().map(|p| p.to_path_buf()).collect();
         walker
             .map(|item| {
                 item.map(|entry| {
@@ -493,6 +494,7 @@ mod root_device_walk_tests {
             .collect()
     }
 
+    /// A directory with "d/f" and "g".
     fn tree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("d")).unwrap();
@@ -501,24 +503,76 @@ mod root_device_walk_tests {
         dir
     }
 
+    fn entries(marked: bool) -> Vec<Result<(String, bool), String>> {
+        ["d", "f", "g"]
+            .into_iter()
+            .map(|name| Ok((name.to_string(), marked)))
+            .collect()
+    }
+
+    fn is_root_error(item: &Result<(String, bool), String>) -> bool {
+        matches!(item, Err(err) if err.contains("backup root"))
+    }
+
     #[test]
     fn on_the_root_filesystem_nothing_is_marked() {
         let dir = tree();
-        let items = walk(dir.path(), false);
-        assert_eq!(items.len(), 3);
-        assert!(items.iter().all(|item| matches!(item, Ok((_, false)))));
+        assert_eq!(walk(&[dir.path()], &[]), entries(false));
     }
 
     #[test]
     fn an_unreadable_root_is_reported_and_everything_below_it_is_marked() {
         let dir = tree();
-        let items = walk(dir.path(), true);
-        // the error comes first, then every entry, all marked
+        let items = walk(&[dir.path()], &[dir.path()]);
+        assert!(is_root_error(&items[0]), "{items:?}");
+        assert_eq!(items[1..], entries(true));
+    }
+
+    #[test]
+    fn directory_roots_are_never_entries_and_each_has_its_own_state() {
+        // two empty directory roots, then one with entries
+        let (empty1, empty2, dir) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tree(),
+        );
+        let roots = [empty1.path(), empty2.path(), dir.path()];
+        // no failure: only the third root's entries, unmarked
+        assert_eq!(walk(&roots, &[]), entries(false));
+        // the first two roots fail: two errors, and the third root, read
+        // fine, starts afresh
+        let items = walk(&roots, &[empty1.path(), empty2.path()]);
         assert!(
-            matches!(&items[0], Err(err) if err.contains("backup root")),
+            is_root_error(&items[0]) && is_root_error(&items[1]),
             "{items:?}"
         );
-        assert_eq!(items.len(), 4);
-        assert!(items[1..].iter().all(|item| matches!(item, Ok((_, true)))));
+        assert_eq!(items[2..], entries(false));
+        // only the last root fails: its entries are marked
+        let items = walk(&roots, &[dir.path()]);
+        assert!(is_root_error(&items[0]), "{items:?}");
+        assert_eq!(items[1..], entries(true));
+        // all fail: one error each, none lost, entries marked
+        let items = walk(&roots, &roots);
+        assert!(items[..3].iter().all(is_root_error), "{items:?}");
+        assert_eq!(items[3..], entries(true));
+    }
+
+    #[test]
+    fn file_and_directory_roots_mixed() {
+        let files = tempfile::tempdir().unwrap();
+        let file = files.path().join("h");
+        std::fs::write(&file, b"z").unwrap();
+        let (empty, dir) = (tempfile::tempdir().unwrap(), tree());
+        let roots = [file.as_path(), empty.path(), dir.path()];
+        // a file root is an entry itself
+        let mut expected = vec![Ok(("h".to_string(), false))];
+        expected.extend(entries(false));
+        assert_eq!(walk(&roots, &[]), expected);
+        // a failing file root: its error, then the file, marked; the next
+        // roots start afresh
+        let items = walk(&roots, &[file.as_path()]);
+        assert!(is_root_error(&items[0]), "{items:?}");
+        assert_eq!(items[1], Ok(("h".to_string(), true)));
+        assert_eq!(items[2..], entries(false));
     }
 }
