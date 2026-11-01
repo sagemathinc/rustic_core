@@ -10,6 +10,7 @@ on:
       - "**.rs"
       - "**.snap"
       - "**.yml"
+      - "**.yaml"
 jobs:
   test:
     name: Generate Coverage Report
@@ -32,7 +33,9 @@ jobs:
         env:
           RUST_BACKTRACE: "0"
         run: |
-          cargo tarpaulin --verbose --all-features --workspace --timeout 120 --out xml
+          # The fixed-chunker prune tests take ~60 s each under instrumentation;
+          # 120 s left too little headroom on slower runners.
+          cargo tarpaulin --verbose --all-features --workspace --timeout 300 --out xml
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@1e68e06f1dbfde0e4cefc87efeba9e4643565303 # v5
