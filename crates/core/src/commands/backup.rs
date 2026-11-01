@@ -116,11 +116,13 @@ pub struct ParentOptions {
     /// every tree of the parent snapshot into an index of directories.
     ///
     /// Inode numbers identify a directory only within one filesystem (or
-    /// btrfs subvolume), so this needs `--one-file-system`, exactly one backup
-    /// path, and parents with the same paths, made the same way (also with
-    /// `--one-file-system`); otherwise it is ignored with a warning. A custom
-    /// `ReadSource` passed to `Repository::archive` must likewise stay within
-    /// one filesystem.
+    /// btrfs subvolume), so this needs `--one-file-system` and exactly one
+    /// backup path, and every parent must have been made the same way of the
+    /// same path (recorded in the snapshot as `single_filesystem`; snapshots
+    /// of older versions don't have it). Otherwise it is ignored with a
+    /// warning. With a custom `ReadSource` (`Repository::archive`), setting
+    /// `--one-file-system` is the caller's assertion that the source stays
+    /// within one filesystem.
     #[cfg_attr(feature = "clap", clap(long, conflicts_with = "force"))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub detect_moves: bool,
@@ -222,10 +224,18 @@ impl ParentOptions {
             .unwrap_or_default()
         };
 
-        // a parent of another tree has unrelated inode numbers
-        let detect_moves_parents_ok = parent.iter().all(|parent| parent.paths == snap.paths);
-        if self.detect_moves && !detect_moves_parents_ok {
-            warn!("ignoring --detect-moves: a parent snapshot has other paths");
+        // Inode numbers identify a directory only within one filesystem, and
+        // a parent of another tree has unrelated ones: move detection needs
+        // this snapshot and every parent to be single-filesystem sources of
+        // the same paths.
+        let detect_moves_ok = snap.single_filesystem
+            && parent
+                .iter()
+                .all(|parent| parent.single_filesystem && parent.paths == snap.paths);
+        if self.detect_moves && !detect_moves_ok {
+            warn!(
+                "ignoring --detect-moves: it needs --one-file-system, one backup path, and parents made the same way of the same path"
+            );
         }
         let (parent_trees, parent_ids): (Vec<_>, _) = parent
             .into_iter()
@@ -241,7 +251,7 @@ impl ParentOptions {
                 self.ignore_ctime,
                 self.ignore_inode,
                 self.restored_cutoff(),
-                (self.detect_moves && detect_moves_parents_ok).then(|| {
+                (self.detect_moves && detect_moves_ok).then(|| {
                     self.detect_moves_max_entries
                         .unwrap_or(DETECT_MOVES_MAX_ENTRIES)
                 }),
@@ -414,6 +424,13 @@ where
         )
     })?;
 
+    // Inode numbers identify a directory only within one filesystem (or btrfs
+    // subvolume): record whether this source is one path read without
+    // leaving its filesystem, as move detection requires of the snapshot and
+    // of its parents. For a custom source, `--one-file-system` is the
+    // caller's assertion that it stays within one filesystem.
+    snap.single_filesystem = opts.ignore_filter_opts.one_file_system && backup_paths.len() == 1;
+
     opts.parent_opts.validate()?;
     let (parent_ids, parent) = opts.parent_opts.get_parent(repo, &snap);
     if parent_ids.is_empty() {
@@ -491,19 +508,6 @@ pub(crate) fn backup<R: IndexedIds>(
         }
     } else {
         let backup_path = source.paths();
-        // Inode numbers identify a directory only within one filesystem (or
-        // btrfs subvolume): move detection needs a single source root that
-        // isn't left (`--one-file-system`).
-        let mut opts = opts.clone();
-        if opts.parent_opts.detect_moves
-            && !(opts.ignore_filter_opts.one_file_system && backup_path.len() == 1)
-        {
-            warn!(
-                "ignoring --detect-moves: it needs --one-file-system and exactly one backup path"
-            );
-            opts.parent_opts.detect_moves = false;
-        }
-        let opts = &opts;
         let src = LocalSource::new(
             opts.ignore_save_opts,
             &opts.excludes,

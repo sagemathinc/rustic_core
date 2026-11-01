@@ -316,8 +316,10 @@ fn synth<S: IndexedIds>(
         opened: opened.clone(),
     };
     let snap = repo.archive(
+        // the caller's assertion that this source stays within one filesystem
         &BackupOptions::default()
             .no_scan(true)
+            .ignore_filter_opts(LocalSourceFilterOptions::default().one_file_system(true))
             .parent_opts(parent_opts),
         &source,
         SnapshotFile::default(),
@@ -544,11 +546,123 @@ fn a_parent_of_other_paths_gives_no_candidates(set_up_repo: Result<RepoOpen>) ->
         &BackupOptions::default()
             .no_scan(true)
             .as_path(PathBuf::from("elsewhere"))
+            .ignore_filter_opts(LocalSourceFilterOptions::default().one_file_system(true))
             .parent_opts(parent(&other, true)),
         &source,
         SnapshotFile::default(),
         &[PathBuf::from("test")],
     )?;
     assert_eq!(*opened.lock().unwrap(), ["new/f"]);
+    Ok(())
+}
+
+#[rstest]
+fn a_custom_source_without_one_file_system_gets_no_candidates(
+    set_up_repo: Result<RepoOpen>,
+) -> Result<()> {
+    // Repository::archive, the entry point the rustic CLI uses
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let (_, first) = synth(
+        &repo,
+        vec![dir("old", 50), file("old/f", 1, Some(1000), b'a')],
+        ParentOptions::default(),
+    )?;
+    let repo = repo.drop_index().to_indexed_ids()?;
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = Synth {
+        entries: vec![dir("new", 50), file("new/f", 1, Some(1000), b'a')],
+        opened: opened.clone(),
+    };
+    let snap = repo.archive(
+        &BackupOptions::default()
+            .no_scan(true)
+            .parent_opts(parent(&first, true)),
+        &source,
+        SnapshotFile::default(),
+        &[PathBuf::from("test")],
+    )?;
+    assert_eq!(*opened.lock().unwrap(), ["new/f"]);
+    assert!(!snap.single_filesystem);
+    Ok(())
+}
+
+/// A real backup of `dir`, with `--one-file-system` or not.
+fn backup_x<S: IndexedIds>(
+    repo: &Repository<S>,
+    dir: &Path,
+    one_file_system: bool,
+    parent_opts: ParentOptions,
+) -> Result<SnapshotFile> {
+    Ok(repo.backup(
+        &BackupOptions::default()
+            .no_scan(true)
+            .as_path(PathBuf::from("/home"))
+            .ignore_filter_opts(
+                LocalSourceFilterOptions::default().one_file_system(one_file_system),
+            )
+            .parent_opts(parent_opts),
+        &PathList::from_iter([dir]),
+        SnapshotFile::default(),
+    )?)
+}
+
+#[rstest]
+fn the_snapshot_records_a_single_filesystem_source(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let dir = tree()?;
+    let with = backup_x(&repo, dir.path(), true, ParentOptions::default())?;
+    let without = backup_x(&repo, dir.path(), false, ParentOptions::default())?;
+    // as stored in the repository
+    let stored = |snap: &SnapshotFile| -> Result<bool> {
+        Ok(repo
+            .get_snapshot_from_str(&snap.id.to_string(), |_| true)?
+            .single_filesystem)
+    };
+    assert!(stored(&with)?);
+    assert!(!stored(&without)?);
+    // two backup paths are not a single filesystem source either
+    let other = tree()?;
+    let two = repo.backup(
+        &BackupOptions::default()
+            .no_scan(true)
+            .ignore_filter_opts(LocalSourceFilterOptions::default().one_file_system(true)),
+        &PathList::from_iter([dir.path(), other.path()]),
+        SnapshotFile::default(),
+    )?;
+    assert!(!stored(&two)?);
+    Ok(())
+}
+
+#[rstest]
+// a parent made without --one-file-system (or by an older version: the
+// marker is absent) gives no candidates
+#[case::unmarked_parent(&[false], 4)]
+// one unmarked parent among marked ones turns detection off
+#[case::mixed_parents(&[true, false], 4)]
+#[case::marked_parent(&[true], 0)]
+fn every_parent_must_be_a_single_filesystem_source(
+    set_up_repo: Result<RepoOpen>,
+    #[case] marked: &[bool],
+    #[case] read: u64,
+) -> Result<()> {
+    let repo = set_up_repo?.to_indexed_ids()?;
+    let dir = tree()?;
+    let parents: Vec<String> = marked
+        .iter()
+        .map(|x| {
+            Ok(backup_x(&repo, dir.path(), *x, ParentOptions::default())?
+                .id
+                .to_string())
+        })
+        .collect::<Result<_>>()?;
+    fs::rename(dir.path().join("big"), dir.path().join("renamed"))?;
+    let repo = repo.drop_index().to_indexed_ids()?;
+    let snap = backup_x(
+        &repo,
+        dir.path(),
+        true,
+        ParentOptions::default().parents(parents).detect_moves(true),
+    )?;
+    assert_eq!(counts(&snap).0, read);
     Ok(())
 }
