@@ -253,6 +253,15 @@ pub struct SnapshotSummary {
     /// Serialized only when non-zero so existing restic/rustic snapshots stay unchanged.
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub error_count: u64,
+
+    /// Files whose content was reused by extent signature (`--reuse-extents`)
+    /// instead of being read. Serialized only when non-zero.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub extent_reused_files: u64,
+
+    /// Bytes of the files counted in `extent_reused_files`.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub extent_reused_bytes: u64,
 }
 
 // serde `skip_serializing_if` always passes a reference.
@@ -288,6 +297,8 @@ impl Default for SnapshotSummary {
             backup_duration: Default::default(),
             total_duration: Default::default(),
             error_count: Default::default(),
+            extent_reused_files: Default::default(),
+            extent_reused_bytes: Default::default(),
         }
     }
 }

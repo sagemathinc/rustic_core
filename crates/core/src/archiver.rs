@@ -1,9 +1,11 @@
+pub(crate) mod extent_reuse;
 pub(crate) mod file_archiver;
 pub(crate) mod parent;
 pub(crate) mod tree;
 pub(crate) mod tree_archiver;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::scope;
 
@@ -14,12 +16,13 @@ use pariter::IteratorExt;
 use crate::{
     Progress,
     archiver::{
+        extent_reuse::{ExtentReuse, SeedTurn},
         file_archiver::FileArchiver,
         parent::{Parent, ParentResult},
         tree::{TreeIterator, TreeType},
         tree_archiver::TreeArchiver,
     },
-    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
+    backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend, node::NodeType},
     blob::BlobType,
     error::{ErrorKind, RusticError, RusticResult},
     index::{
@@ -130,6 +133,18 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         self
     }
 
+    /// Reuse the content of files whose btrfs extents are exactly those of a
+    /// file archived in this run, or of an unchanged file vouched for by the
+    /// parent (see `BackupOptions::reuse_extents`). `root` must be a read-only
+    /// btrfs subvolume (or a directory in one); otherwise this logs why it
+    /// does nothing.
+    #[must_use]
+    pub fn reuse_extents(mut self, root: Option<&Path>) -> Self {
+        self.file_archiver
+            .reuse_extents(root.and_then(ExtentReuse::new).map(Arc::new));
+        self
+    }
+
     /// Archives the given source.
     ///
     /// This will archive all files and trees in the given source.
@@ -170,6 +185,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         let incomplete = AtomicBool::new(false);
         let error_count = AtomicU64::new(0);
         let hardlinks = self.file_archiver.hardlink_cache();
+        let extents = self.file_archiver.extent_reuse();
 
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
@@ -240,7 +256,25 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                         {
                             cache.seed(node);
                         }
-                        Some(item)
+                        // The extent cache is seeded by the workers, which
+                        // scan; a file to read waits for the seeds before it.
+                        let turn = match (&extents, &item) {
+                            (Some(extents), TreeType::Other((_, node, (_, parent))))
+                                if node.node_type == NodeType::File && node.meta.size > 0 =>
+                            {
+                                match parent {
+                                    ParentResult::Matched(())
+                                        if self.parent.last_match_vouches_for_inode() =>
+                                    {
+                                        extents.seed_turn()
+                                    }
+                                    ParentResult::Matched(()) => SeedTurn::None,
+                                    _ => extents.read_turn(),
+                                }
+                            }
+                            _ => SeedTurn::None,
+                        };
+                        Some((item, turn))
                     }
                     Err(err) => {
                         incomplete.store(true, Ordering::Relaxed);
@@ -250,7 +284,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 },
             )
             // archive files in parallel
-            .parallel_map_scoped(s, |item| self.file_archiver.process(item, p))
+            .parallel_map_scoped(s, |(item, turn)| self.file_archiver.process(item, turn, p))
             .readahead_scoped(s)
             .filter_map(|item| match item {
                 Ok(item) => Some(item),
@@ -273,6 +307,9 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         let (id, mut summary) = self.tree_archiver.finalize(self.parent.tree_id())?;
         stats.apply(&mut summary, BlobType::Data);
         summary.error_count = error_count.load(Ordering::Relaxed);
+        if let Some(extents) = &extents {
+            (summary.extent_reused_files, summary.extent_reused_bytes) = extents.stats();
+        }
         self.snap.tree = id;
 
         self.indexer.write().unwrap().finalize()?;
@@ -285,6 +322,13 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 ErrorKind::InputOutput,
                 "Strict backup failed because source inspection or file processing was incomplete. No snapshot was saved.",
             ));
+        }
+
+        if let Some(extents) = &extents
+            && let Err(err) = extents.verify_end()
+        {
+            p.finish();
+            return Err(err);
         }
 
         summary.finalize(&self.snap.time);
