@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs::File,
     io::Read,
     path::Path,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
@@ -9,6 +10,7 @@ use jiff::Timestamp;
 
 use crate::{
     archiver::{
+        extent_reuse::{ExtentReuse, SeedTurn},
         parent::{ItemWithParent, ParentResult},
         tree::TreeType,
         tree_archiver::TreeItem,
@@ -45,6 +47,18 @@ pub(crate) struct FileArchiver<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> 
     config: ConfigFile,
     /// Content of multiply hard-linked files archived in this run, if enabled.
     hardlinks: Option<Arc<HardlinkCache>>,
+    /// Content by extent signature (`--reuse-extents`), if enabled and pinned.
+    extents: Option<Arc<ExtentReuse>>,
+}
+
+/// A file opened for `--reuse-extents`, with its signature.
+struct Signed<'a> {
+    extents: &'a ExtentReuse,
+    /// The file (a duplicate of the reader's descriptor), for the post-read scan.
+    file: File,
+    signature: Vec<u8>,
+    /// Parent seeds numbered below this may serve the file.
+    before: u64,
 }
 
 /// The identity of an inode in this run: device and inode number.
@@ -53,17 +67,17 @@ type InodeKey = (u64, u64);
 /// What a hard-linked file looked like when its content was archived. A path
 /// of the same inode reuses that content only if it looks exactly the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HardlinkState {
+pub(crate) struct HardlinkState {
     size: u64,
     mtime: Timestamp,
     ctime: Timestamp,
 }
 
-/// One inode in this run: its archived content, or the read in progress.
+/// One key in this run: its archived content, or the read in progress.
 #[derive(Debug)]
-enum Slot {
-    Done(HardlinkState, Vec<DataId>),
-    Reading(HardlinkState, Arc<Pending>),
+enum Slot<S> {
+    Done(S, Vec<DataId>),
+    Reading(S, Arc<Pending>),
 }
 
 /// The state of a read that other paths wait for.
@@ -102,59 +116,109 @@ impl Pending {
     }
 }
 
-/// What a worker does with a file (see [`HardlinkCache::claim`]).
+/// What a worker does with a file (see [`ContentCache::claim_key`]).
 #[derive(Debug)]
-pub(crate) enum Claim<'c> {
+pub(crate) enum Claim<'c, K: CacheKey, S: CacheState> {
     /// Read the file, as without the cache.
     Read,
-    /// Use this content: the same inode, unchanged, archived in this run.
+    /// Use this content: the same key and state, archived in this run.
     Reuse(Vec<DataId>),
-    /// Read the file for every path of this inode; others wait for it.
-    Own(OwnedRead<'c>),
+    /// Read the file for every path with this key; others wait for it.
+    Own(OwnedRead<'c, K, S>),
 }
 
-/// The duty to read an inode for all its paths. Finishing it publishes the
-/// content; dropping it unfinished (an error, a panic) lets the waiting
+/// The duty to read a file for all paths with its key. Finishing it publishes
+/// the content; dropping it unfinished (an error, a panic) lets the waiting
 /// paths read the file themselves, and nothing is cached.
 #[derive(Debug)]
-pub(crate) struct OwnedRead<'c> {
-    cache: &'c HardlinkCache,
-    key: InodeKey,
-    state: HardlinkState,
+pub(crate) struct OwnedRead<'c, K: CacheKey, S: CacheState> {
+    cache: &'c ContentCache<K, S>,
+    key: Option<K>,
+    state: S,
     pending: Arc<Pending>,
-    finished: bool,
 }
 
-impl OwnedRead<'_> {
+impl<K: CacheKey, S: CacheState> OwnedRead<'_, K, S> {
+    /// Publish the content (or, with `None`, withdraw the read).
     pub(crate) fn finish(mut self, content: Option<&Vec<DataId>>) {
-        self.finished = true;
-        self.cache
-            .finish(self.key, &self.state, &self.pending, content.cloned());
-    }
-}
-
-impl Drop for OwnedRead<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
+        if let Some(key) = self.key.take() {
             self.cache
-                .finish(self.key, &self.state, &self.pending, None);
+                .finish(key, &self.state, &self.pending, content.cloned());
         }
     }
 }
 
-/// Content of multiply hard-linked files archived in this run, so that each
-/// such inode is read once: one path reads it, the others wait and reuse.
-#[derive(Debug, Default)]
-pub(crate) struct HardlinkCache {
-    slots: Mutex<HashMap<InodeKey, Slot>>,
+impl<K: CacheKey, S: CacheState> Drop for OwnedRead<'_, K, S> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.cache.finish(key, &self.state, &self.pending, None);
+        }
+    }
+}
+
+/// A cache key: an inode, or an exact extent signature.
+pub(crate) trait CacheKey: std::hash::Hash + Eq + Clone + std::fmt::Debug {}
+impl<T: std::hash::Hash + Eq + Clone + std::fmt::Debug> CacheKey for T {}
+
+/// What must also be equal for a key's content to be reused.
+pub(crate) trait CacheState: Eq + Clone + std::fmt::Debug {}
+impl<T: Eq + Clone + std::fmt::Debug> CacheState for T {}
+
+/// Content archived in this run, by key, so that each key is read once: one
+/// path reads it, the others wait and reuse.
+#[derive(Debug)]
+pub(crate) struct ContentCache<K, S> {
+    slots: Mutex<HashMap<K, Slot<S>>>,
+}
+
+impl<K, S> Default for ContentCache<K, S> {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::default(),
+        }
+    }
+}
+
+/// Content of multiply hard-linked files, by inode.
+pub(crate) type HardlinkCache = ContentCache<InodeKey, HardlinkState>;
+
+/// Content of files by extent signature (`--reuse-extents`). The signature is
+/// exact; the state says where the content came from.
+pub(crate) type ExtentCache = ContentCache<Vec<u8>, ExtentOrigin>;
+
+/// Where content cached under a signature came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExtentOrigin {
+    /// A file read in this run: it serves every file.
+    Read,
+    /// The parent match with this seed ticket: it serves only the files after
+    /// it in the tree, so that whether a file is read never depends on timing.
+    Seed(u64),
+}
+
+impl ExtentOrigin {
+    /// Whether this content may serve a file that comes after the seeds
+    /// numbered below `before`.
+    pub(crate) const fn serves(self, before: u64) -> bool {
+        match self {
+            Self::Read => true,
+            Self::Seed(ticket) => ticket < before,
+        }
+    }
 }
 
 impl HardlinkCache {
     /// The key and state of a node that may share its content with other paths:
-    /// a regular file with more than one link, a known inode and both times.
+    /// a regular file with more than one link, a known device and inode, and
+    /// both times. Without a device (`set-devid = never`), inode numbers of
+    /// different filesystems could collide.
     fn key_and_state(node: &Node) -> Option<(InodeKey, HardlinkState)> {
         let meta = &node.meta;
-        if node.node_type != NodeType::File || meta.links < 2 || meta.inode == 0 {
+        if node.node_type != NodeType::File
+            || meta.links < 2
+            || meta.inode == 0
+            || meta.device_id == 0
+        {
             return None;
         }
         Some((
@@ -167,39 +231,62 @@ impl HardlinkCache {
         ))
     }
 
-    fn slots(&self) -> MutexGuard<'_, HashMap<InodeKey, Slot>> {
+    /// Decide how to get this node's content (see [`ContentCache::claim_key`]).
+    pub(crate) fn claim(&self, node: &Node) -> Claim<'_, InodeKey, HardlinkState> {
+        Self::key_and_state(node).map_or(Claim::Read, |(key, state)| {
+            let serves = |seen: &HardlinkState| *seen == state;
+            self.claim_key(key, state.clone(), serves)
+        })
+    }
+
+    /// Remember content known without reading: a file unchanged since its
+    /// parent snapshot.
+    pub(crate) fn seed(&self, node: &Node) {
+        if let (Some((key, state)), Some(content)) = (Self::key_and_state(node), &node.content) {
+            self.seed_key(key, state, content);
+        }
+    }
+}
+
+impl<K: CacheKey, S: CacheState> ContentCache<K, S> {
+    fn slots(&self) -> MutexGuard<'_, HashMap<K, Slot<S>>> {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Decide how to get this node's content: reuse it, wait for the path
-    /// reading it now (never holding the map's lock while waiting), or read
-    /// it for all paths of the inode.
-    pub(crate) fn claim(&self, node: &Node) -> Claim<'_> {
-        let Some((key, state)) = Self::key_and_state(node) else {
-            return Claim::Read;
-        };
+    /// Decide how to get a file's content: reuse content whose state `serves`
+    /// this file, wait for the path reading it now (never holding the map's
+    /// lock while waiting), or read it for all paths with this key, as
+    /// `state`.
+    pub(crate) fn claim_key(
+        &self,
+        key: K,
+        state: S,
+        serves: impl Fn(&S) -> bool,
+    ) -> Claim<'_, K, S> {
         let mut slots = self.slots();
         let pending = match slots.get(&key) {
-            Some(Slot::Done(seen, content)) if *seen == state => {
+            Some(Slot::Done(seen, content)) if serves(seen) => {
                 let content = content.clone();
                 drop(slots);
                 return Claim::Reuse(content);
             }
-            Some(Slot::Reading(seen, pending)) if *seen == state => {
+            Some(Slot::Reading(seen, pending)) if serves(seen) => {
                 let pending = Arc::clone(pending);
                 drop(slots);
                 pending
             }
             _ => {
                 let pending = Arc::new(Pending::default());
-                _ = slots.insert(key, Slot::Reading(state.clone(), Arc::clone(&pending)));
+                _ = slots.insert(
+                    key.clone(),
+                    Slot::Reading(state.clone(), Arc::clone(&pending)),
+                );
                 drop(slots);
                 return Claim::Own(OwnedRead {
                     cache: self,
-                    key,
+                    key: Some(key),
                     state,
                     pending,
-                    finished: false,
                 });
             }
         };
@@ -208,13 +295,7 @@ impl HardlinkCache {
 
     /// Publish (or, on failure, withdraw) an owned read, if the slot is still
     /// that read's, and wake its waiters.
-    fn finish(
-        &self,
-        key: InodeKey,
-        state: &HardlinkState,
-        pending: &Arc<Pending>,
-        content: Option<Vec<DataId>>,
-    ) {
+    fn finish(&self, key: K, state: &S, pending: &Arc<Pending>, content: Option<Vec<DataId>>) {
         {
             let mut slots = self.slots();
             if let Some(Slot::Reading(_, current)) = slots.get(&key)
@@ -233,16 +314,22 @@ impl HardlinkCache {
         pending.finish(content);
     }
 
-    /// Remember content known without reading: a file unchanged since its
-    /// parent snapshot.
-    pub(crate) fn seed(&self, node: &Node) {
-        let (Some((key, state)), Some(content)) = (Self::key_and_state(node), &node.content) else {
-            return;
-        };
+    /// Remember content known without reading (a file unchanged since its
+    /// parent snapshot), unless a read of the key is in progress.
+    pub(crate) fn seed_key(&self, key: K, state: S, content: &[DataId]) {
         let mut slots = self.slots();
         if !matches!(slots.get(&key), Some(Slot::Reading(..))) {
-            _ = slots.insert(key, Slot::Done(state, content.clone()));
+            _ = slots.insert(key, Slot::Done(state, content.to_vec()));
         }
+    }
+
+    /// Like [`Self::seed_key`], but only for a key not seen yet in this run:
+    /// what a file got must not change for the files after it.
+    pub(crate) fn seed_new_key(&self, key: K, state: S, content: &[DataId]) {
+        _ = self
+            .slots()
+            .entry(key)
+            .or_insert_with(|| Slot::Done(state, content.to_vec()));
     }
 }
 
@@ -280,6 +367,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             data_packer,
             config: config.clone(),
             hardlinks: None,
+            extents: None,
         })
     }
 
@@ -293,6 +381,16 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         self.hardlinks.clone()
     }
 
+    /// Reuse content by extent signature in this run.
+    pub(crate) fn reuse_extents(&mut self, extents: Option<Arc<ExtentReuse>>) {
+        self.extents = extents;
+    }
+
+    /// The extent reuse state, if enabled and pinned.
+    pub(crate) fn extent_reuse(&self) -> Option<Arc<ExtentReuse>> {
+        self.extents.clone()
+    }
+
     /// Processes the given item.
     ///
     /// # Type Parameters
@@ -302,6 +400,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// # Arguments
     ///
     /// * `item` - The item to process.
+    /// * `turn` - Its place in the order of extent cache seeds.
     /// * `p` - The progress tracker.
     ///
     /// # Errors
@@ -314,6 +413,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     pub(crate) fn process<O: ReadSourceOpen>(
         &self,
         item: ItemWithParent<Option<O>>,
+        turn: SeedTurn,
         p: &Progress,
     ) -> RusticResult<TreeItem> {
         Ok(match item {
@@ -321,6 +421,10 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             TreeType::EndTree => TreeType::EndTree,
             TreeType::Other((path, node, (open, parent))) => {
                 let (node, filesize) = if matches!(parent, ParentResult::Matched(())) {
+                    if let (Some(extents), SeedTurn::Seed(seed)) = (&self.extents, turn) {
+                        extents.seed(open, node.content.as_deref(), seed.ticket());
+                        drop(seed);
+                    }
                     let size = node.meta.size;
                     p.inc(size);
                     (node, size)
@@ -339,9 +443,9 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                             p.inc(size);
                             (node, size)
                         }
-                        Claim::Read => self.read_file(&path, open, node, p)?,
+                        Claim::Read => self.read_file(&path, open, node, &turn, p)?,
                         Claim::Own(owned) => {
-                            let result = self.read_file(&path, open, node, p);
+                            let result = self.read_file(&path, open, node, &turn, p);
                             owned.finish(
                                 result
                                     .as_ref()
@@ -359,14 +463,19 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         })
     }
 
-    /// Open and archive a regular file.
+    /// Open and archive a regular file, or reuse the content of a file with
+    /// the same extents.
     fn read_file<O: ReadSourceOpen>(
         &self,
         path: &Path,
         open: Option<O>,
         node: Node,
+        turn: &SeedTurn,
         p: &Progress,
     ) -> RusticResult<(Node, u64)> {
+        if let Some(extents) = &self.extents {
+            extents.wait_for(turn);
+        }
         let r = open
             .ok_or_else(
                 || RusticError::new(
@@ -383,10 +492,68 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
                 .prepend_guidance_line("Failed to open ReadSourceOpen at `{path}`")
                 .attach_context("path", path.display().to_string())
             })?;
-        self.backup_reader(r, node, p).map_err(|err| {
+        let signed = self.extents.as_deref().and_then(|extents| {
+            let file = r.as_file()?.try_clone().ok()?;
+            let signature = extents.signature(&file)?;
+            Some(Signed {
+                extents,
+                file,
+                signature,
+                before: turn.before(),
+            })
+        });
+        let result = match signed {
+            Some(signed) => self.read_by_signature(&signed, r, node, p),
+            None => self.backup_reader(r, node, p),
+        };
+        result.map_err(|err| {
             err.prepend_guidance_line("Error while backing up `{path}`")
                 .attach_context("path", path.display().to_string())
         })
+    }
+
+    /// Reuse the content of a file with the same signature, wait for the path
+    /// reading it now, or read the file and publish its content for others,
+    /// after a post-read scan shows the extents unchanged.
+    fn read_by_signature(
+        &self,
+        signed: &Signed<'_>,
+        r: SourceReader<impl Read + Send + 'static>,
+        node: Node,
+        p: &Progress,
+    ) -> RusticResult<(Node, u64)> {
+        let Signed {
+            extents,
+            file,
+            signature,
+            before,
+        } = signed;
+        let serves = |seen: &ExtentOrigin| seen.serves(*before);
+        match extents
+            .cache
+            .claim_key(signature.clone(), ExtentOrigin::Read, serves)
+        {
+            Claim::Reuse(content) => {
+                let mut node = node;
+                node.content = Some(content);
+                let size = node.meta.size;
+                extents.reused(size);
+                p.inc(size);
+                Ok((node, size))
+            }
+            Claim::Read => self.backup_reader(r, node, p),
+            Claim::Own(owned) => {
+                let result = self.backup_reader(r, node, p);
+                owned.finish(
+                    result
+                        .as_ref()
+                        .ok()
+                        .and_then(|(node, _)| node.content.as_ref())
+                        .filter(|_| extents.still(file, signature)),
+                );
+                result
+            }
+        }
     }
 
     // TODO: add documentation!
@@ -482,7 +649,7 @@ mod tests {
         vec![DataId::from(hash(bytes))]
     }
 
-    fn own(claim: Claim<'_>) -> OwnedRead<'_> {
+    fn own<K: CacheKey, S: CacheState>(claim: Claim<'_, K, S>) -> OwnedRead<'_, K, S> {
         match claim {
             Claim::Own(owned) => owned,
             other => panic!("expected to own the read, got {other:?}"),
@@ -592,6 +759,37 @@ mod tests {
         assert!(matches!(
             cache.claim(&file(2, 45, 3, 100, 200)),
             Claim::Own(_)
+        ));
+    }
+
+    #[test]
+    fn a_seed_serves_only_the_files_after_it() {
+        let cache = ExtentCache::default();
+        let sig = b"sig".to_vec();
+        cache.seed_new_key(sig.clone(), ExtentOrigin::Seed(3), &content(b"abc"));
+        let claim = |before: u64| {
+            cache.claim_key(sig.clone(), ExtentOrigin::Read, |seen: &ExtentOrigin| {
+                seen.serves(before)
+            })
+        };
+        // a file after seed 3 reuses its content
+        assert!(matches!(claim(4), Claim::Reuse(c) if c == content(b"abc")));
+        // a file before it reads, and then serves everyone
+        own(claim(3)).finish(Some(&content(b"abc")));
+        assert!(matches!(claim(0), Claim::Reuse(c) if c == content(b"abc")));
+    }
+
+    #[test]
+    fn a_seed_never_replaces_what_files_already_got() {
+        let cache = ExtentCache::default();
+        let sig = b"sig".to_vec();
+        let serves_all = |seen: &ExtentOrigin| seen.serves(u64::MAX);
+        own(cache.claim_key(sig.clone(), ExtentOrigin::Read, serves_all))
+            .finish(Some(&content(b"read")));
+        cache.seed_new_key(sig.clone(), ExtentOrigin::Seed(0), &content(b"seed"));
+        assert!(matches!(
+            cache.claim_key(sig, ExtentOrigin::Read, serves_all),
+            Claim::Reuse(c) if c == content(b"read")
         ));
     }
 }

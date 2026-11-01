@@ -32,6 +32,8 @@ default = []
 cli = ["merge", "clap"]
 merge = ["dep:conflate"]
 clap = ["dep:clap"]
+# test-only switches for --reuse-extents (never in a release build)
+test-hooks = []
 
 [package.metadata.docs.rs]
 all-features = true
@@ -79,6 +81,9 @@ nix = { version = "0.31.1", default-features = false, features = ["user", "fs"] 
 path-dedot = "4.0.1"
 same-file = "1.0.6"
 walkdir = "2.5.0"
+
+# btrfs extent signatures (--reuse-extents)
+rustic_extents = { workspace = true }
 
 # cache
 cachedir = "0.3.1"

@@ -32,9 +32,21 @@ pub struct Parent {
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
     ignore_inode: bool,
-    /// Whether the last file processed matched a parent node that also has
-    /// its device, inode number and ctime (see [`Parent::vouches_for_inode`]).
-    last_match_vouches_for_inode: bool,
+    /// What the last file processed was vouched for by its parent match.
+    last_vouch: Vouch,
+}
+
+/// What a parent match vouches for, beyond its own path (ordered: an inode
+/// vouch includes a content vouch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Vouch {
+    /// Nothing: trusted for this path only (or no match).
+    #[default]
+    Nothing,
+    /// The file's content (see [`Parent::vouches_for_content`]).
+    Content,
+    /// The content of every path of its inode (see [`Parent::vouches_for_inode`]).
+    Inode,
 }
 
 /// The result of a parent search.
@@ -116,16 +128,27 @@ impl Parent {
             stack: Vec::new(),
             ignore_ctime,
             ignore_inode,
-            last_match_vouches_for_inode: false,
+            last_vouch: Vouch::Nothing,
         }
     }
 
-    /// Whether a matched parent node proves the content of the inode itself,
-    /// not only of this path: the device, the inode number and the ctime were
-    /// all present on both sides, compared and equal. A match that ignored
-    /// ctime or inode (by option, or because one side lacks them) only vouches
-    /// for this path.
-    fn vouches_for_inode(
+    /// Whether a matched parent node is strong evidence that the file still
+    /// has the parent's content. The match itself already compared the type
+    /// (a regular file here), the size and the mtime; on top of that, the
+    /// inode number (nonzero) and the ctime (present, to the nanosecond) must
+    /// be equal, with no option ignoring them. A weaker match is trusted for
+    /// this path only and vouches for nothing.
+    ///
+    /// The ctime is what makes this meaningful: unlike the mtime it can't be
+    /// set from userspace, and any write or metadata change moves it to the
+    /// current time. A file deleted and recreated, even with the same inode
+    /// number, size and mtime, has a new ctime.
+    ///
+    /// The device is not part of this: `--reuse-extents` keys reused content
+    /// on the file's own current extent signature, not on its identity, and
+    /// devices are often not recorded (`set-devid = hardlink` stores 0 for
+    /// files with one link) or differ between snapshots of the same tree.
+    fn vouches_for_content(
         ignore_ctime: bool,
         ignore_inode: bool,
         p_node: &Node,
@@ -136,15 +159,36 @@ impl Parent {
             && !ignore_inode
             && p_meta.inode != 0
             && p_meta.inode == meta.inode
-            && p_meta.device_id == meta.device_id
             && p_meta.ctime.is_some()
             && p_meta.ctime == meta.ctime
     }
 
+    /// Whether a matched parent node proves the content of the inode itself,
+    /// not only of this path: it vouches for the content, and the device was
+    /// recorded (nonzero) on both sides and equal, so `(device, inode)`
+    /// identifies the inode. A match without a device vouches for no other
+    /// path.
+    fn vouches_for_inode(
+        ignore_ctime: bool,
+        ignore_inode: bool,
+        p_node: &Node,
+        node: &Node,
+    ) -> bool {
+        Self::vouches_for_content(ignore_ctime, ignore_inode, p_node, node)
+            && p_node.meta.device_id != 0
+            && p_node.meta.device_id == node.meta.device_id
+    }
+
     /// Whether the last file passed to [`Parent::process`] matched its parent
     /// node strongly enough to vouch for every path of its inode.
-    pub(crate) const fn last_match_vouches_for_inode(&self) -> bool {
-        self.last_match_vouches_for_inode
+    pub(crate) fn last_match_vouches_for_inode(&self) -> bool {
+        self.last_vouch >= Vouch::Inode
+    }
+
+    /// Whether the last file passed to [`Parent::process`] matched its parent
+    /// node strongly enough to vouch for its content.
+    pub(crate) fn last_match_vouches_for_content(&self) -> bool {
+        self.last_vouch >= Vouch::Content
     }
 
     /// Returns the parent node with the given name.
@@ -320,13 +364,28 @@ impl Parent {
             }
             TreeType::Other((path, mut node, open)) => {
                 let (ignore_ctime, ignore_inode) = (self.ignore_ctime, self.ignore_inode);
-                let mut vouches = false;
+                let mut vouch = Vouch::Nothing;
                 let parent = self.is_parent(&node, &node.name());
                 let parent = match parent {
                     ParentResult::Matched(p_node) => {
                         if p_node.content.iter().flatten().all(|id| index.has_data(id)) {
-                            vouches =
-                                Self::vouches_for_inode(ignore_ctime, ignore_inode, p_node, &node);
+                            vouch = if Self::vouches_for_inode(
+                                ignore_ctime,
+                                ignore_inode,
+                                p_node,
+                                &node,
+                            ) {
+                                Vouch::Inode
+                            } else if Self::vouches_for_content(
+                                ignore_ctime,
+                                ignore_inode,
+                                p_node,
+                                &node,
+                            ) {
+                                Vouch::Content
+                            } else {
+                                Vouch::Nothing
+                            };
                             node.content.clone_from(&p_node.content);
                             ParentResult::Matched(())
                         } else {
@@ -339,7 +398,7 @@ impl Parent {
                     }
                     parent_result => parent_result.map(|_| ()),
                 };
-                self.last_match_vouches_for_inode = vouches;
+                self.last_vouch = vouch;
                 TreeType::Other((path, node, (open, parent)))
             }
         };
@@ -378,7 +437,7 @@ mod tests {
             stack: Vec::new(),
             ignore_ctime: false,
             ignore_inode,
-            last_match_vouches_for_inode: false,
+            last_vouch: Vouch::Nothing,
         };
 
         let result = parent.is_parent(&file_with_inode(2), OsStr::new("file"));
@@ -403,6 +462,7 @@ mod tests {
     #[case::parent_inode_zero(false, false, (1, 0, Some(9)), (1, 0, Some(9)), false)]
     #[case::inode_differs(false, false, (1, 5, Some(9)), (1, 6, Some(9)), false)]
     #[case::device_differs(false, false, (1, 5, Some(9)), (2, 5, Some(9)), false)]
+    #[case::device_not_recorded(false, false, (0, 5, Some(9)), (0, 5, Some(9)), false)]
     #[case::ctime_missing(false, false, (1, 5, None), (1, 5, None), false)]
     #[case::parent_ctime_missing(false, false, (1, 5, None), (1, 5, Some(9)), false)]
     #[case::ctime_differs(false, false, (1, 5, Some(9)), (1, 5, Some(10)), false)]
@@ -417,6 +477,35 @@ mod tests {
         let node = file_with(current.0, current.1, current.2);
         assert_eq!(
             Parent::vouches_for_inode(ignore_ctime, ignore_inode, &p_node, &node),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::all_equal(false, false, (1, 5, Some(9)), (1, 5, Some(9)), true)]
+    #[case::device_not_recorded(false, false, (0, 5, Some(9)), (0, 5, Some(9)), true)]
+    #[case::device_differs(false, false, (1, 5, Some(9)), (2, 5, Some(9)), true)]
+    #[case::ignore_ctime(true, false, (0, 5, Some(9)), (0, 5, Some(9)), false)]
+    #[case::ignore_inode(false, true, (0, 5, Some(9)), (0, 5, Some(9)), false)]
+    #[case::inode_not_recorded(false, false, (0, 0, Some(9)), (0, 0, Some(9)), false)]
+    #[case::inode_differs(false, false, (0, 5, Some(9)), (0, 6, Some(9)), false)]
+    #[case::ctime_missing(false, false, (0, 5, None), (0, 5, None), false)]
+    #[case::parent_ctime_missing(false, false, (0, 5, None), (0, 5, Some(9)), false)]
+    #[case::ctime_differs(false, false, (0, 5, Some(9)), (0, 5, Some(10)), false)]
+    // deleted and recreated: the inode number is reused, size and mtime are
+    // the same (the match compared those), the ctime is new
+    #[case::recreated_same_inode(false, false, (0, 5, Some(9)), (0, 5, Some(1_000)), false)]
+    fn a_match_vouches_for_content_by_inode_and_ctime(
+        #[case] ignore_ctime: bool,
+        #[case] ignore_inode: bool,
+        #[case] parent: (u64, u64, Option<i64>),
+        #[case] current: (u64, u64, Option<i64>),
+        #[case] expected: bool,
+    ) {
+        let p_node = file_with(parent.0, parent.1, parent.2);
+        let node = file_with(current.0, current.1, current.2);
+        assert_eq!(
+            Parent::vouches_for_content(ignore_ctime, ignore_inode, &p_node, &node),
             expected
         );
     }

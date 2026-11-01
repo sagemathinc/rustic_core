@@ -184,6 +184,15 @@ pub struct BackupOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub reuse_hardlinks: bool,
 
+    /// Read a file whose btrfs data extents are exactly those of a file already
+    /// archived in this run (or of an unchanged file vouched for by the parent
+    /// snapshot) only once: the others reuse its content. Needs a read-only
+    /// btrfs subvolume as the source and the privilege to search its tree;
+    /// otherwise this logs why it does nothing and every file is read.
+    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub reuse_extents: bool,
+
     /// Metadata-only work admission before content processing.
     #[cfg_attr(feature = "clap", clap(flatten))]
     #[serde(flatten)]
@@ -308,7 +317,8 @@ where
     info!("starting to backup {backup_paths:?} ...");
     let archiver = Archiver::new(be, index, repo.config(), parent, snap)?
         .strict(opts.strict)
-        .reuse_hardlinks(opts.reuse_hardlinks);
+        .reuse_hardlinks(opts.reuse_hardlinks)
+        .reuse_extents(opts.reuse_extents.then(|| backup_paths[0].as_path()));
     let p = repo.progress_bytes("backing up...");
 
     archiver.archive(

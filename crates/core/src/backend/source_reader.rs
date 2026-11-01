@@ -45,6 +45,14 @@ impl<R: Read> SourceReader<R> {
         })
     }
 
+    /// The opened local file, if this reader is one.
+    pub(crate) const fn as_file(&self) -> Option<&File> {
+        match &self.inner {
+            Source::File { file, .. } => Some(file),
+            Source::Plain(_) => None,
+        }
+    }
+
     /// Skip only if the entire requested range is a real hole before EOF.
     pub(crate) fn skip_hole(&mut self, length: usize) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
