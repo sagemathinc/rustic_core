@@ -485,12 +485,21 @@ impl PrunePack {
         Self::from_index_pack(p, true)
     }
 
+    /// The size to store in an `IndexPack`: none if the blobs determine it,
+    /// but the explicit size of a pack without blobs (an unindexed pack file
+    /// marked for deletion), which nothing else records. Dropping it would
+    /// leave the header size (36) in the index, and `check` would then report
+    /// a size mismatch for that pack forever.
+    fn index_size(&self) -> Option<u32> {
+        self.blobs.is_empty().then_some(self.size)
+    }
+
     /// Convert the `PrunePack` into an `IndexPack`. Set time of not already set.
     fn into_index_pack(self, time: Timestamp) -> IndexPack {
         IndexPack {
             id: self.id,
             time: self.time.or(Some(time)),
-            size: None,
+            size: self.index_size(),
             blobs: self.blobs,
         }
     }
@@ -504,7 +513,7 @@ impl PrunePack {
         IndexPack {
             id: self.id,
             time: Some(time),
-            size: None,
+            size: self.index_size(),
             blobs: self.blobs,
         }
     }
@@ -1670,5 +1679,56 @@ mod tests {
 
         collect_used_node_blobs([node], &mut ids);
         assert!(ids.contains_key(&BlobId::from(*tree_id)));
+    }
+
+    #[test]
+    fn a_marked_pack_without_blobs_keeps_its_size() {
+        // an unindexed pack file, marked for deletion by an earlier prune
+        let marked = IndexPack {
+            id: PackId::default(),
+            time: Some(Timestamp::from_second(1_700_000_000).unwrap()),
+            size: Some(33_000),
+            blobs: Vec::new(),
+        };
+        let pack = PrunePack::from_index_pack_marked(marked.clone());
+        assert_eq!(pack.size, 33_000);
+        // kept marked (KeepMarked), re-marked or recovered by a later prune
+        let time = Timestamp::from_second(1_700_000_100).unwrap();
+        for index_pack in [
+            pack.clone().into_index_pack(time),
+            pack.into_index_pack_with_time(time),
+        ] {
+            assert_eq!(index_pack.size, Some(33_000));
+            assert_eq!(index_pack.pack_size(), 33_000);
+        }
+        // the kept-marked entry is the one read back, unchanged
+        let kept = PrunePack::from_index_pack_marked(marked).into_index_pack(time);
+        assert_eq!(
+            kept.time,
+            Some(Timestamp::from_second(1_700_000_000).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_pack_with_blobs_still_stores_no_size() {
+        let blob = IndexBlob {
+            id: BlobId::default(),
+            tpe: BlobType::Data,
+            location: crate::blob::BlobLocation {
+                offset: 0,
+                length: 100,
+                uncompressed_length: None,
+            },
+        };
+        let pack = PrunePack::from_index_pack_unmarked(IndexPack {
+            id: PackId::default(),
+            time: None,
+            size: None,
+            blobs: vec![blob],
+        });
+        let time = Timestamp::from_second(1_700_000_000).unwrap();
+        // the blobs determine the size, as before
+        assert_eq!(pack.clone().into_index_pack(time).size, None);
+        assert_eq!(pack.into_index_pack_with_time(time).size, None);
     }
 }
