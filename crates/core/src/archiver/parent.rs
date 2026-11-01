@@ -29,8 +29,12 @@ pub struct Parent {
     tree_ids: Vec<TreeId>,
     /// The parent trees of the current directory.
     trees: Vec<ParentTree>,
-    /// The stack of parent trees.
-    stack: Vec<Vec<ParentTree>>,
+    /// The stack of parent trees, with whether that level was below a
+    /// filesystem boundary.
+    stack: Vec<(Vec<ParentTree>, bool)>,
+    /// The current directory is on another filesystem than the backup root,
+    /// or below such a directory: nothing from the parent applies.
+    below_boundary: bool,
     /// Ignore ctime when comparing nodes.
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
@@ -40,11 +44,10 @@ pub struct Parent {
     /// `ParentOptions::restored_before`).
     restored_before: Option<Timestamp>,
     /// Find a moved directory's parent trees by its inode (see
-    /// `ParentOptions::detect_moves`).
-    detect_moves: bool,
-    /// The most entries (directories indexed plus trees visited) the
-    /// directory index may hold; above it, move detection is off.
-    detect_moves_max_entries: usize,
+    /// `ParentOptions::detect_moves`), with at most this many entries
+    /// (directories indexed plus trees visited) in the directory index;
+    /// above it, move detection is off.
+    detect_moves: Option<usize>,
     /// The parent trees' directories by inode, built on first use (empty if
     /// it would have exceeded `detect_moves_max_entries`).
     dir_inodes: Option<HashMap<u64, SmallVec<[TreeId; 1]>>>,
@@ -165,11 +168,11 @@ impl Parent {
             tree_ids,
             trees,
             stack: Vec::new(),
+            below_boundary: false,
             ignore_ctime,
             ignore_inode,
             restored_before,
-            detect_moves: detect_moves.is_some(),
-            detect_moves_max_entries: detect_moves.unwrap_or_default(),
+            detect_moves,
             dir_inodes: None,
             last_vouch: Vouch::Nothing,
         }
@@ -361,6 +364,10 @@ impl Parent {
         let ignore_ctime = self.ignore_ctime || restored;
         let ignore_inode = self.ignore_inode || restored;
 
+        // a node on another filesystem than the backup root (see `set_dir`)
+        if node.is_other_filesystem() {
+            return ParentResult::NotFound;
+        }
         let mut p_node = self.p_node(name).peekable();
         if p_node.peek().is_none() {
             return ParentResult::NotFound;
@@ -412,6 +419,16 @@ impl Parent {
         name: &OsStr,
         node: &Node,
     ) {
+        // On another filesystem than the backup root, or below one: inode
+        // numbers there are another filesystem's, so neither the parent at
+        // this path nor a moved candidate applies; everything is read.
+        if self.below_boundary || node.is_other_filesystem() {
+            let old_tree = std::mem::take(&mut self.trees);
+            self.stack.push((old_tree, self.below_boundary));
+            self.below_boundary = true;
+            return;
+        }
+
         let mut same_inode = false;
         // (subtree, moved): a subtree of a moved tree is moved too
         let mut new_ids: Vec<(TreeId, bool)> = self
@@ -428,8 +445,11 @@ impl Parent {
         // A directory that is not at its parent's path (moved or renamed, or
         // new) also gets the parent trees of the directory with its inode, as
         // moved trees: their files match only with full identity.
-        if self.detect_moves && node.meta.inode != 0 && !same_inode {
-            let (roots, max_entries) = (&self.tree_ids, self.detect_moves_max_entries);
+        if let Some(max_entries) = self.detect_moves
+            && node.meta.inode != 0
+            && !same_inode
+        {
+            let roots = &self.tree_ids;
             let moved = self
                 .dir_inodes
                 .get_or_insert_with(|| {
@@ -468,7 +488,7 @@ impl Parent {
             )
             .collect();
         let old_tree = std::mem::replace(&mut self.trees, new_tree);
-        self.stack.push(old_tree);
+        self.stack.push((old_tree, self.below_boundary));
     }
 
     // TODO: add documentation!
@@ -477,8 +497,9 @@ impl Parent {
     ///
     /// * If the tree stack is empty.
     fn finish_dir(&mut self) -> Result<(), TreeStackEmptyError> {
-        let tree = self.stack.pop().ok_or(TreeStackEmptyError)?;
+        let (tree, below_boundary) = self.stack.pop().ok_or(TreeStackEmptyError)?;
         self.trees = tree;
+        self.below_boundary = below_boundary;
 
         Ok(())
     }
@@ -598,11 +619,11 @@ mod tests {
                 moved: false,
             }],
             stack: Vec::new(),
+            below_boundary: false,
             ignore_ctime: false,
             ignore_inode,
             restored_before: None,
-            detect_moves: false,
-            detect_moves_max_entries: 0,
+            detect_moves: None,
             dir_inodes: None,
             last_vouch: Vouch::Nothing,
         };

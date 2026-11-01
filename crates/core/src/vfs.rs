@@ -379,6 +379,7 @@ impl Vfs {
                 meta,
                 content: None,
                 subtree: None,
+                ..Default::default()
             }),
             VfsPath::Link(target) => Ok(Node {
                 name: String::new(),
@@ -386,6 +387,7 @@ impl Vfs {
                 meta,
                 content: None,
                 subtree: None,
+                ..Default::default()
             }),
         }
     }

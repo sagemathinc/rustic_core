@@ -79,13 +79,17 @@ impl LocalSourceSaveOptions {
     /// * If metadata could not be read.
     /// * If the xattr of the entry could not be read.
     pub fn map_entry(self, entry: DirEntry) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
-        self.map_entry_with_metadata_strictness(entry, false)
+        self.map_entry_with_metadata_strictness(entry, false, RootDevice::NoDevices)
     }
 
+    /// Maps a directory entry; an entry that `root_dev` (its backup root's
+    /// device) marks is flagged
+    /// ([`crate::repofile::Node::set_other_filesystem`]).
     pub(crate) fn map_entry_with_metadata_strictness(
         self,
         entry: DirEntry,
         strict_metadata: bool,
+        root_dev: RootDevice,
     ) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
         let name = entry.file_name();
         let m = entry
@@ -135,7 +139,8 @@ impl LocalSourceSaveOptions {
             extended_attributes,
         };
 
-        let node = self.to_node(&entry, &m, meta)?;
+        let mut node = self.to_node(&entry, &m, meta)?;
+        node.set_other_filesystem(root_dev.marks(&m));
         let path = entry.into_path();
         let open = Some(OpenFile(path.clone()));
         Ok(ReadSourceEntry { path, node, open })
@@ -342,5 +347,80 @@ impl LocalSourceSaveOptions {
 
     fn to_node_other(self, name: &OsStr, _m: &std::fs::Metadata, meta: Metadata) -> Node {
         Node::new_node(name, NodeType::File, meta)
+    }
+}
+
+/// The device of a backup root, which the entries below it are compared
+/// with (see [`crate::repofile::Node::set_other_filesystem`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootDevice {
+    /// No device ids on this platform: nothing is marked.
+    NoDevices,
+    /// The root's device: entries on another one are marked.
+    Known(u64),
+    /// The root's device couldn't be read: every entry is marked, so nothing
+    /// below this root gets anything from the parent snapshot.
+    Unknown,
+}
+
+impl RootDevice {
+    /// The device of a backup root, from the result of reading its metadata.
+    pub(crate) fn of<E>(metadata: Result<std::fs::Metadata, E>) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            metadata.map_or(Self::Unknown, |m| Self::Known(m.dev()))
+        }
+        #[cfg(not(unix))]
+        {
+            _ = metadata;
+            Self::NoDevices
+        }
+    }
+
+    /// Whether an entry with this metadata is on another filesystem than the
+    /// root (or must be treated as such).
+    pub(crate) fn marks(self, m: &std::fs::Metadata) -> bool {
+        match self {
+            Self::NoDevices => false,
+            Self::Unknown => true,
+            Self::Known(root) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    m.dev() != root
+                }
+                #[cfg(not(unix))]
+                {
+                    _ = (m, root);
+                    false
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod root_device_tests {
+    use super::RootDevice;
+
+    #[test]
+    fn an_unreadable_root_marks_everything() {
+        let err: Result<std::fs::Metadata, std::io::Error> = Err(std::io::Error::other("x"));
+        let root = RootDevice::of(err);
+        assert_eq!(root, RootDevice::Unknown);
+        let m = std::fs::metadata(std::env::temp_dir()).unwrap();
+        assert!(root.marks(&m));
+    }
+
+    #[test]
+    fn a_known_root_marks_only_other_devices() {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(std::env::temp_dir()).unwrap();
+        let root = RootDevice::of::<std::io::Error>(Ok(m.clone()));
+        assert_eq!(root, RootDevice::Known(m.dev()));
+        assert!(!root.marks(&m));
+        assert!(RootDevice::Known(m.dev().wrapping_add(1)).marks(&m));
+        assert!(!RootDevice::NoDevices.marks(&m));
     }
 }

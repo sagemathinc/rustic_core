@@ -74,7 +74,7 @@ pub enum NodeErrorKind<'a> {
 #[cfg(not(windows))]
 pub(crate) type NodeResult<'a, T> = Result<T, NodeErrorKind<'a>>;
 
-#[derive(Default, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 /// A node within the tree hierarchy
 pub struct Node {
     /// Name of the node: filename or dirname.
@@ -104,6 +104,49 @@ pub struct Node {
     ///
     /// This should be only set for directories. (TODO: Check if this is correct)
     pub subtree: Option<TreeId>,
+    #[serde(skip)]
+    /// Set while archiving for a node on another filesystem than its backup
+    /// root (see [`Node::set_other_filesystem`]); never stored.
+    pub(crate) other_filesystem: Transient,
+}
+
+// As derived, without the transient mark (so debug output is unchanged).
+#[allow(clippy::missing_fields_in_debug, reason = "the mark is transient")]
+impl Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("name", &self.name)
+            .field("node_type", &self.node_type)
+            .field("meta", &self.meta)
+            .field("content", &self.content)
+            .field("subtree", &self.subtree)
+            .finish()
+    }
+}
+
+/// A flag that exists only while archiving: it is never stored, and all
+/// values compare equal, so it doesn't change how nodes compare.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Transient(pub(crate) bool);
+
+impl PartialEq for Transient {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Transient {}
+
+impl PartialOrd for Transient {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Transient {
+    fn cmp(&self, _other: &Self) -> Ordering {
+        Ordering::Equal
+    }
 }
 
 #[serde_as]
@@ -307,7 +350,23 @@ impl Node {
             content: None,
             subtree: None,
             meta,
+            other_filesystem: Transient::default(),
         }
+    }
+
+    /// Marks the node as being on another filesystem than the root of the
+    /// backup source it belongs to (a mount point or nested btrfs subvolume,
+    /// or anything below one). While archiving, such a node and everything
+    /// below it get nothing from the parent snapshot: they are read in full.
+    /// The mark is never stored.
+    pub fn set_other_filesystem(&mut self, other_filesystem: bool) {
+        self.other_filesystem = Transient(other_filesystem);
+    }
+
+    #[must_use]
+    /// Whether [`Node::set_other_filesystem`] marked this node.
+    pub const fn is_other_filesystem(&self) -> bool {
+        self.other_filesystem.0
     }
     #[must_use]
     /// Evaluates if this node is a directory

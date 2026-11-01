@@ -1,5 +1,6 @@
 pub mod mapper;
 pub use mapper::LocalSourceSaveOptions;
+use mapper::RootDevice;
 
 use std::{
     ffi::OsString,
@@ -293,27 +294,19 @@ impl ReadSource for LocalSource {
     ///
     /// An iterator over the entries of the local source.
     fn entries(&self) -> Self::Iter {
-        LocalSourceWalker {
-            walker: self.builder.build(),
-            save_opts: self.save_opts,
-            strict_metadata: false,
-        }
+        LocalSourceWalker::new(self.builder.build(), self.save_opts, false)
     }
 
     fn strict_entries(&self) -> Self::Iter {
-        LocalSourceWalker {
-            walker: self.builder.build(),
-            save_opts: self.save_opts,
-            strict_metadata: true,
-        }
+        LocalSourceWalker::new(self.builder.build(), self.save_opts, true)
     }
 
     fn inventory_entries(&self) -> Option<Self::Iter> {
-        Some(LocalSourceWalker {
-            walker: self.inventory_builder.build(),
-            save_opts: self.save_opts,
-            strict_metadata: true,
-        })
+        Some(LocalSourceWalker::new(
+            self.inventory_builder.build(),
+            self.save_opts,
+            true,
+        ))
     }
 }
 
@@ -336,20 +329,56 @@ pub struct LocalSourceWalker {
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
     strict_metadata: bool,
+    /// The device of the backup root being walked.
+    root_dev: RootDevice,
+    /// A file backup root held back while the error about reading its
+    /// metadata is returned first.
+    pending: Option<Result<ignore::DirEntry, ignore::Error>>,
+    /// Tests only: reading the metadata of these backup roots fails.
+    #[cfg(test)]
+    fail_root_metadata: Vec<PathBuf>,
 }
 
-impl Iterator for LocalSourceWalker {
-    type Item = RusticResult<ReadSourceEntry<OpenFile>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.walker.next() {
-            // ignore root dir, i.e. an entry with depth 0 of type dir
-            Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
-                self.walker.next()
-            }
-            item => item,
+impl LocalSourceWalker {
+    fn new(walker: Walk, save_opts: LocalSourceSaveOptions, strict_metadata: bool) -> Self {
+        Self {
+            walker,
+            save_opts,
+            strict_metadata,
+            root_dev: RootDevice::NoDevices,
+            pending: None,
+            #[cfg(test)]
+            fail_root_metadata: Vec::new(),
         }
-        .map(|e| {
+    }
+
+    /// Starts a backup root (an entry of depth 0): its device is what the
+    /// entries below it are compared with. If its metadata can't be read,
+    /// everything below the root is treated as on another filesystem, and an
+    /// error is returned to be reported.
+    fn enter_root<E: std::fmt::Display>(
+        &mut self,
+        path: &Path,
+        metadata: Result<std::fs::Metadata, E>,
+    ) -> Option<Box<RusticError>> {
+        let message = metadata.as_ref().err().map(ToString::to_string);
+        self.root_dev = RootDevice::of(metadata);
+        (self.root_dev == RootDevice::Unknown).then(|| {
+            RusticError::new(
+                ErrorKind::InputOutput,
+                "Failed to read the metadata of backup root `{path}`: nothing below it is matched with the parent snapshot. {message}",
+            )
+            .attach_context("path", path.display().to_string())
+            .attach_context("message", message.unwrap_or_default())
+        })
+    }
+
+    fn map_item(
+        &self,
+        item: Option<Result<ignore::DirEntry, ignore::Error>>,
+    ) -> Option<RusticResult<ReadSourceEntry<OpenFile>>> {
+        let root_dev = self.root_dev;
+        item.map(|e| {
             let entry = e.map_err(|err| {
                 let path = ignore_error_path(&err);
                 let rustic_err = if path.is_some() {
@@ -372,7 +401,7 @@ impl Iterator for LocalSourceWalker {
             })?;
             let path = entry.path().display().to_string();
             self.save_opts
-                .map_entry_with_metadata_strictness(entry, self.strict_metadata)
+                .map_entry_with_metadata_strictness(entry, self.strict_metadata, root_dev)
                 .map_err(|err| {
                     RusticError::with_source(
                         ErrorKind::InputOutput,
@@ -382,5 +411,168 @@ impl Iterator for LocalSourceWalker {
                     .attach_context("path", path)
                 })
         })
+    }
+
+    /// Enters a backup root (an entry of depth 0); returns the error about
+    /// reading its metadata, if any.
+    fn check_root(&mut self, entry: &ignore::DirEntry) -> Option<Box<RusticError>> {
+        let path = entry.path().to_path_buf();
+        let metadata = entry.metadata().map_err(|err| err.to_string());
+        #[cfg(test)]
+        let metadata = if self.fail_root_metadata.contains(&path) {
+            Err("injected".to_string())
+        } else {
+            metadata
+        };
+        self.enter_root(&path, metadata)
+    }
+}
+
+impl Iterator for LocalSourceWalker {
+    type Item = RusticResult<ReadSourceEntry<OpenFile>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // a file root whose error was just returned: the file itself, with
+        // that root's (unknown) device
+        if let Some(item) = self.pending.take() {
+            return self.map_item(Some(item));
+        }
+        loop {
+            let item = self.walker.next();
+            let Some(Ok(entry)) = &item else {
+                return self.map_item(item);
+            };
+            if entry.depth() != 0 {
+                return self.map_item(item);
+            }
+            // A backup root sets the device its entries are compared with. A
+            // directory root is not an entry itself (it is skipped); a file
+            // root is.
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            if let Some(err) = self.check_root(entry) {
+                if !is_dir {
+                    self.pending = item;
+                }
+                return Some(Err(err));
+            }
+            if !is_dir {
+                return self.map_item(item);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod root_device_walk_tests {
+    use super::*;
+
+    /// Walk these backup roots, reading the metadata of `failing` roots
+    /// fails; return each item as (name, marked) or the error.
+    fn walk(roots: &[&Path], failing: &[&Path]) -> Vec<Result<(String, bool), String>> {
+        let source = LocalSource::new(
+            LocalSourceSaveOptions::default(),
+            &Excludes::default(),
+            &LocalSourceFilterOptions::default(),
+            roots,
+        )
+        .unwrap();
+        let mut walker = source.entries();
+        walker.fail_root_metadata = failing.iter().map(|p| p.to_path_buf()).collect();
+        walker
+            .map(|item| {
+                item.map(|entry| {
+                    let name = entry
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    (name, entry.node.is_other_filesystem())
+                })
+                .map_err(|err| err.to_string())
+            })
+            .collect()
+    }
+
+    /// A directory with "d/f" and "g".
+    fn tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        std::fs::write(dir.path().join("d/f"), b"x").unwrap();
+        std::fs::write(dir.path().join("g"), b"y").unwrap();
+        dir
+    }
+
+    fn entries(marked: bool) -> Vec<Result<(String, bool), String>> {
+        ["d", "f", "g"]
+            .into_iter()
+            .map(|name| Ok((name.to_string(), marked)))
+            .collect()
+    }
+
+    fn is_root_error(item: &Result<(String, bool), String>) -> bool {
+        matches!(item, Err(err) if err.contains("backup root"))
+    }
+
+    #[test]
+    fn on_the_root_filesystem_nothing_is_marked() {
+        let dir = tree();
+        assert_eq!(walk(&[dir.path()], &[]), entries(false));
+    }
+
+    #[test]
+    fn an_unreadable_root_is_reported_and_everything_below_it_is_marked() {
+        let dir = tree();
+        let items = walk(&[dir.path()], &[dir.path()]);
+        assert!(is_root_error(&items[0]), "{items:?}");
+        assert_eq!(items[1..], entries(true));
+    }
+
+    #[test]
+    fn directory_roots_are_never_entries_and_each_has_its_own_state() {
+        // two empty directory roots, then one with entries
+        let (empty1, empty2, dir) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tree(),
+        );
+        let roots = [empty1.path(), empty2.path(), dir.path()];
+        // no failure: only the third root's entries, unmarked
+        assert_eq!(walk(&roots, &[]), entries(false));
+        // the first two roots fail: two errors, and the third root, read
+        // fine, starts afresh
+        let items = walk(&roots, &[empty1.path(), empty2.path()]);
+        assert!(
+            is_root_error(&items[0]) && is_root_error(&items[1]),
+            "{items:?}"
+        );
+        assert_eq!(items[2..], entries(false));
+        // only the last root fails: its entries are marked
+        let items = walk(&roots, &[dir.path()]);
+        assert!(is_root_error(&items[0]), "{items:?}");
+        assert_eq!(items[1..], entries(true));
+        // all fail: one error each, none lost, entries marked
+        let items = walk(&roots, &roots);
+        assert!(items[..3].iter().all(is_root_error), "{items:?}");
+        assert_eq!(items[3..], entries(true));
+    }
+
+    #[test]
+    fn file_and_directory_roots_mixed() {
+        let files = tempfile::tempdir().unwrap();
+        let file = files.path().join("h");
+        std::fs::write(&file, b"z").unwrap();
+        let (empty, dir) = (tempfile::tempdir().unwrap(), tree());
+        let roots = [file.as_path(), empty.path(), dir.path()];
+        // a file root is an entry itself
+        let mut expected = vec![Ok(("h".to_string(), false))];
+        expected.extend(entries(false));
+        assert_eq!(walk(&roots, &[]), expected);
+        // a failing file root: its error, then the file, marked; the next
+        // roots start afresh
+        let items = walk(&roots, &[file.as_path()]);
+        assert!(is_root_error(&items[0]), "{items:?}");
+        assert_eq!(items[1], Ok(("h".to_string(), true)));
+        assert_eq!(items[2..], entries(false));
     }
 }
