@@ -25,6 +25,7 @@
 mod integration {
     mod append_only;
     mod backup;
+    mod boundaries;
     mod check;
     mod chunker;
     mod copy;

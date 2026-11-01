@@ -297,6 +297,7 @@ impl ReadSource for LocalSource {
             walker: self.builder.build(),
             save_opts: self.save_opts,
             strict_metadata: false,
+            root_dev: None,
         }
     }
 
@@ -305,6 +306,7 @@ impl ReadSource for LocalSource {
             walker: self.builder.build(),
             save_opts: self.save_opts,
             strict_metadata: true,
+            root_dev: None,
         }
     }
 
@@ -313,6 +315,7 @@ impl ReadSource for LocalSource {
             walker: self.inventory_builder.build(),
             save_opts: self.save_opts,
             strict_metadata: true,
+            root_dev: None,
         })
     }
 }
@@ -336,20 +339,37 @@ pub struct LocalSourceWalker {
     /// The save options to use.
     save_opts: LocalSourceSaveOptions,
     strict_metadata: bool,
+    /// The device of the backup root being walked (Unix).
+    root_dev: Option<u64>,
+}
+
+/// The device of a directory entry, where there is one (Unix).
+fn entry_dev(entry: &ignore::DirEntry) -> Option<u64> {
+    entry.metadata().ok().as_ref().and_then(mapper::raw_dev)
 }
 
 impl Iterator for LocalSourceWalker {
     type Item = RusticResult<ReadSourceEntry<OpenFile>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.walker.next() {
+        let mut item = self.walker.next();
+        // a backup root (depth 0) sets the device its entries are compared with
+        if let Some(Ok(entry)) = &item
+            && entry.depth() == 0
+        {
+            self.root_dev = entry_dev(entry);
             // ignore root dir, i.e. an entry with depth 0 of type dir
-            Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
-                self.walker.next()
+            if entry.file_type().unwrap().is_dir() {
+                item = self.walker.next();
+                if let Some(Ok(entry)) = &item
+                    && entry.depth() == 0
+                {
+                    self.root_dev = entry_dev(entry);
+                }
             }
-            item => item,
         }
-        .map(|e| {
+        let root_dev = self.root_dev;
+        item.map(|e| {
             let entry = e.map_err(|err| {
                 let path = ignore_error_path(&err);
                 let rustic_err = if path.is_some() {
@@ -372,7 +392,7 @@ impl Iterator for LocalSourceWalker {
             })?;
             let path = entry.path().display().to_string();
             self.save_opts
-                .map_entry_with_metadata_strictness(entry, self.strict_metadata)
+                .map_entry_with_metadata_strictness(entry, self.strict_metadata, root_dev)
                 .map_err(|err| {
                     RusticError::with_source(
                         ErrorKind::InputOutput,

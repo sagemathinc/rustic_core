@@ -79,13 +79,17 @@ impl LocalSourceSaveOptions {
     /// * If metadata could not be read.
     /// * If the xattr of the entry could not be read.
     pub fn map_entry(self, entry: DirEntry) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
-        self.map_entry_with_metadata_strictness(entry, false)
+        self.map_entry_with_metadata_strictness(entry, false, None)
     }
 
+    /// Maps a directory entry; with `root_dev` (the device of its backup
+    /// root), an entry on another device is marked
+    /// ([`crate::repofile::Node::set_other_filesystem`]).
     pub(crate) fn map_entry_with_metadata_strictness(
         self,
         entry: DirEntry,
         strict_metadata: bool,
+        root_dev: Option<u64>,
     ) -> IgnoreResult<ReadSourceEntry<OpenFile>> {
         let name = entry.file_name();
         let m = entry
@@ -135,7 +139,8 @@ impl LocalSourceSaveOptions {
             extended_attributes,
         };
 
-        let node = self.to_node(&entry, &m, meta)?;
+        let mut node = self.to_node(&entry, &m, meta)?;
+        node.set_other_filesystem(root_dev.is_some_and(|root| raw_dev(&m) != Some(root)));
         let path = entry.into_path();
         let open = Some(OpenFile(path.clone()));
         Ok(ReadSourceEntry { path, node, open })
@@ -343,4 +348,18 @@ impl LocalSourceSaveOptions {
     fn to_node_other(self, name: &OsStr, _m: &std::fs::Metadata, meta: Metadata) -> Node {
         Node::new_node(name, NodeType::File, meta)
     }
+}
+
+/// The device of a file (Unix only).
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps, reason = "None on other platforms")]
+pub(crate) fn raw_dev(m: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(m.dev())
+}
+
+/// The device of a file (Unix only).
+#[cfg(not(unix))]
+pub(crate) fn raw_dev(_m: &std::fs::Metadata) -> Option<u64> {
+    None
 }
