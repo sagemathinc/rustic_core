@@ -35,7 +35,10 @@ trait Scanner: std::fmt::Debug + Send + Sync {
     fn verify_end(&self) -> Result<(), String>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl Scanner for rustic_extents::linux::ExtentScanner {
     fn signature_of(&self, file: &File) -> Option<Vec<u8>> {
         self.signature_of(file)
@@ -54,15 +57,21 @@ fn pin(root: &Path, hooks: &hooks::Hooks) -> Result<Box<dyn Scanner>, &'static s
         return Ok(fake);
     }
     let root = File::open(root).map_err(|_| "cannot open source")?;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         rustic_extents::linux::ExtentScanner::pin(root, hooks.skip_barrier())
             .map(|scanner| -> Box<dyn Scanner> { Box::new(scanner) })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     {
         drop(root);
-        Err("not btrfs")
+        Err("unsupported platform")
     }
 }
 
@@ -359,7 +368,13 @@ mod hooks {
                 })
         }
 
-        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        #[cfg_attr(
+            not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
+            allow(dead_code)
+        )]
         pub(super) fn skip_barrier(&self) -> bool {
             if self.skip_barrier {
                 warn!("extent barrier disabled (test-hooks)");
@@ -406,7 +421,13 @@ mod hooks {
             None
         }
         #[allow(clippy::unused_self)]
-        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        #[cfg_attr(
+            not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
+            allow(dead_code)
+        )]
         pub(super) const fn skip_barrier(&self) -> bool {
             false
         }

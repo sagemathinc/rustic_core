@@ -128,6 +128,10 @@ pub mod vfs;
 // re-export jiff
 pub use jiff;
 
+/// Whether this build supports `BackupOptions::reuse_extents` (Linux on
+/// `x86_64` or `aarch64`); elsewhere the option is a logged no-op.
+pub const REUSE_EXTENTS_SUPPORTED: bool = rustic_extents::SUPPORTED;
+
 // rustic_core Public API
 pub use crate::{
     backend::{

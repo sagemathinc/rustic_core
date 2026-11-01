@@ -3,7 +3,10 @@
 //! `extent_sig ROOT FILE...` (FILE relative to ROOT); prints one line per file:
 //! `<path> <signature hex | ->`, then the end-of-run check.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn main() {
     use rustic_extents::linux::ExtentScanner;
     use std::{fmt::Write, fs::File};
@@ -35,5 +38,8 @@ fn main() {
     println!("end: {:?}", scanner.verify_end());
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 fn main() {}

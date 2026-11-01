@@ -264,7 +264,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                             {
                                 match parent {
                                     ParentResult::Matched(())
-                                        if self.parent.last_match_vouches_for_inode() =>
+                                        if self.parent.last_match_vouches_for_content() =>
                                     {
                                         extents.seed_turn()
                                     }

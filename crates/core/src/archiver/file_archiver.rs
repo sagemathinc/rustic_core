@@ -209,10 +209,16 @@ impl ExtentOrigin {
 
 impl HardlinkCache {
     /// The key and state of a node that may share its content with other paths:
-    /// a regular file with more than one link, a known inode and both times.
+    /// a regular file with more than one link, a known device and inode, and
+    /// both times. Without a device (`set-devid = never`), inode numbers of
+    /// different filesystems could collide.
     fn key_and_state(node: &Node) -> Option<(InodeKey, HardlinkState)> {
         let meta = &node.meta;
-        if node.node_type != NodeType::File || meta.links < 2 || meta.inode == 0 {
+        if node.node_type != NodeType::File
+            || meta.links < 2
+            || meta.inode == 0
+            || meta.device_id == 0
+        {
             return None;
         }
         Some((

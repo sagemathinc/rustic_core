@@ -162,6 +162,36 @@ mod fake {
     }
 
     #[rstest]
+    fn a_metadata_change_since_the_parent_seeds_nothing(
+        set_up_repo: Result<RepoOpen>,
+    ) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = set_up_repo?.to_indexed_ids()?;
+        let dir = fake_source()?;
+        let x = signed("x", 1, 300_000);
+        write(dir.path(), "m", &x)?;
+        let (repo, first) = backup(repo, dir.path(), true, None, ParentOptions::default())?;
+        // same inode, size and mtime, but a chmod moved the ctime: "m" no
+        // longer matches its parent, so it is read and seeds nothing; "a"
+        // reads first and "m", "n", "z" reuse it
+        let m = dir.path().join("m");
+        fs::set_permissions(&m, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&m, fs::Permissions::from_mode(0o644))?;
+        for name in ["a", "n", "z"] {
+            write(dir.path(), name, &x)?;
+        }
+        let (_, second) = backup(
+            repo,
+            dir.path(),
+            true,
+            Some(&first),
+            ParentOptions::default(),
+        )?;
+        assert_eq!(reused(&second), (3, 3 * 300_000));
+        Ok(())
+    }
+
+    #[rstest]
     fn a_changed_source_saves_no_snapshot(set_up_repo: Result<RepoOpen>) -> Result<()> {
         let repo = set_up_repo?.to_indexed_ids()?;
         let dir = fake_source()?;

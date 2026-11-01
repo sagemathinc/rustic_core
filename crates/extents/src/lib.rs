@@ -20,6 +20,14 @@
 
 use std::fmt;
 
+/// Whether this build can compute signatures: Linux on `x86_64` or `aarch64`,
+/// the architectures whose ioctl encoding the `linux` module hard-codes.
+/// Elsewhere `--reuse-extents` is a no-op.
+pub const SUPPORTED: bool = cfg!(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+));
+
 /// Domain tag of the canonical encoding.
 const SIGNATURE_TAG: &[u8] = b"rustic-extent-sig/v1";
 
@@ -235,7 +243,10 @@ pub fn parse_search_buffer(
     Some((extents, last_offset))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[allow(unsafe_code)]
 pub mod linux {
     //! The ioctls. Every failure means "no signature" for that file, or "no-op"
