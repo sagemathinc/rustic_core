@@ -79,15 +79,25 @@ pub struct ParentOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub ignore_inode: bool,
 
-    /// The backup source is a complete restore of the (single, explicit)
-    /// parent snapshot into an empty directory, and that restore finished at
-    /// this time (RFC 3339). A file whose ctime is before it still holds what
-    /// the restore wrote, so it matches its parent node on type, size and
-    /// mtime alone; its ctime and inode, new on the restored tree, are not
-    /// compared. A file changed later has a later ctime and is compared as
-    /// usual. Use it for the first backup after moving or restoring a whole
-    /// tree, which otherwise reads every file again. Ignored, with a warning,
-    /// unless exactly one parent is given with `--parent`.
+    /// The backup source is a restore of the (single, explicit) parent
+    /// snapshot, and TIME (RFC 3339) is when that restore returned. A file
+    /// whose ctime is more than 2 s before TIME (`RESTORED_BEFORE_MARGIN`)
+    /// matches its parent node on type, size and mtime alone: its ctime and
+    /// inode, new on the restored tree, are not compared. Files changed later,
+    /// and those the restore wrote in its last 2 s, are compared as usual.
+    /// The margin covers coarse kernel timestamps (a write just after TIME
+    /// can get a ctime up to one timer tick before it).
+    ///
+    /// Only for a tree that nothing but the restore wrote: restored complete
+    /// into an empty directory, with no other writer (the project included)
+    /// from before the restore started until TIME was taken. TIME is taken on
+    /// the host that ran the restore, with the clock that stamps the files'
+    /// ctimes: a local filesystem, not a remote one whose server clock may be
+    /// skewed by more than the margin. That clock must not step back before
+    /// this backup. A change made during
+    /// that window with the same size and mtime would be missed. A TIME in
+    /// the future is an error; without exactly one `--parent` the option is
+    /// ignored with a warning.
     #[cfg_attr(
         feature = "clap",
         clap(long, value_name = "TIME", conflicts_with = "force")
@@ -97,11 +107,38 @@ pub struct ParentOptions {
     pub restored_before: Option<Timestamp>,
 }
 
+/// How long before `--restored-before` a file's ctime must be.
+///
+/// Only such a file is taken as written by the restore. This is more than a
+/// timer tick of coarse kernel timestamps (up to 10 ms), with room for clock
+/// uncertainty.
+pub const RESTORED_BEFORE_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_secs(2);
+
 impl ParentOptions {
-    /// The restore time to apply (see [`ParentOptions::restored_before`]):
-    /// only with exactly one explicit parent, which must be the snapshot the
-    /// source was restored from.
-    fn effective_restored_before(&self) -> Option<Timestamp> {
+    /// Fails if [`ParentOptions::restored_before`] is in the future: every
+    /// file would match, including those changed after the restore.
+    ///
+    /// # Errors
+    ///
+    /// * If `restored_before` is later than now.
+    pub(crate) fn validate(&self) -> RusticResult<()> {
+        if let Some(restored_before) = self.restored_before
+            && restored_before > Timestamp::now()
+        {
+            return Err(RusticError::new(
+                ErrorKind::InvalidInput,
+                "--restored-before `{time}` is in the future.",
+            )
+            .attach_context("time", restored_before.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The ctime cutoff for restored files (see
+    /// [`ParentOptions::restored_before`]): the restore time less
+    /// [`RESTORED_BEFORE_MARGIN`], and only with exactly one explicit parent,
+    /// which must be the snapshot the source was restored from.
+    fn restored_cutoff(&self) -> Option<Timestamp> {
         let restored_before = self.restored_before?;
         if self.force || self.parents.len() != 1 {
             warn!(
@@ -109,7 +146,7 @@ impl ParentOptions {
             );
             return None;
         }
-        Some(restored_before)
+        restored_before.checked_sub(RESTORED_BEFORE_MARGIN).ok()
     }
 
     /// Get parent snapshot.
@@ -167,7 +204,7 @@ impl ParentOptions {
                 parent_trees,
                 self.ignore_ctime,
                 self.ignore_inode,
-                self.effective_restored_before(),
+                self.restored_cutoff(),
             ),
         )
     }
@@ -337,6 +374,7 @@ where
         )
     })?;
 
+    opts.parent_opts.validate()?;
     let (parent_ids, parent) = opts.parent_opts.get_parent(repo, &snap);
     if parent_ids.is_empty() {
         info!("using no parent");

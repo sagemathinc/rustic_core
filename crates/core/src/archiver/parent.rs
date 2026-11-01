@@ -33,7 +33,8 @@ pub struct Parent {
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
     ignore_inode: bool,
-    /// The source was restored from the parent, finishing at this time (see
+    /// The source was restored from the parent: files with a ctime before
+    /// this cutoff were written by the restore (see
     /// `ParentOptions::restored_before`).
     restored_before: Option<Timestamp>,
     /// What the last file processed was vouched for by its parent match.
@@ -104,8 +105,8 @@ impl Parent {
     /// * `tree_id` - The tree id of the parent tree.
     /// * `ignore_ctime` - Ignore ctime when comparing nodes.
     /// * `ignore_inode` - Ignore inode number when comparing nodes.
-    /// * `restored_before` - The source was restored from this parent, and the
-    ///   restore finished at this time.
+    /// * `restored_before` - The source was restored from this parent, and
+    ///   files with a ctime before this cutoff were written by the restore.
     pub(crate) fn new(
         be: &impl DecryptReadBackend,
         index: &impl ReadGlobalIndex,
@@ -140,12 +141,12 @@ impl Parent {
         }
     }
 
-    /// Whether `node` was last changed before the restore it came from
-    /// finished: its ctime is present and strictly before
-    /// [`Parent::restored_before`]. Such a file still holds what the restore
-    /// wrote, i.e. the parent's content at its path, so its ctime and inode
-    /// (new on the restored tree) are not compared with the parent's. Any
-    /// later change moves its ctime past that time.
+    /// Whether `node` was last changed by the restore it came from: its ctime
+    /// is present and strictly before the cutoff [`Parent::restored_before`].
+    /// Such a file still holds what the restore wrote, i.e. the parent's
+    /// content at its path, so its ctime and inode (new on the restored tree)
+    /// are not compared with the parent's. Any later change moves its ctime
+    /// past the cutoff.
     fn restored_unchanged(&self, node: &Node) -> bool {
         self.restored_before
             .zip(node.meta.ctime)

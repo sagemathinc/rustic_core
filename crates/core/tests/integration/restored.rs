@@ -228,16 +228,20 @@ fn files_the_restore_wrote_match_their_parent(set_up_repo: Result<RepoOpen>) -> 
 
 #[rstest]
 #[case::changed_after_the_restore(3001)]
-// strictly before: a change at the restore time itself is read
 #[case::changed_at_the_restore_time(3000)]
+// within the margin: a write just after TIME can get a coarse ctime up to a
+// timer tick before it, so files changed less than 2 s before TIME are read
+#[case::coarse_ctime_just_before_the_restore_time(2999)]
+// strictly before the cutoff (TIME less the margin)
+#[case::at_the_cutoff(2998)]
 fn a_file_changed_after_the_restore_is_read(
     set_up_repo: Result<RepoOpen>,
     #[case] ctime: i64,
 ) -> Result<()> {
     let (repo, first) = first_backup(set_up_repo)?;
     let mut files: Vec<File> = original().iter().map(File::restored).collect();
-    // "b" rewritten after the restore with other bytes of the same size, and
-    // its mtime set back: only the ctime shows the change
+    // "b" rewritten with other bytes of the same size, and its mtime set
+    // back: only the ctime shows the change
     files[1].ctime = ctime;
     files[1].byte = b'B';
     let (opened, second) = archive(
@@ -252,6 +256,45 @@ fn a_file_changed_after_the_restore_is_read(
     assert_eq!(second[0], first[0]);
     assert_ne!(second[1], first[1]);
     assert_eq!(second[2], first[2]);
+    Ok(())
+}
+
+/// Why nothing but the restore may write to the tree until TIME is taken: a
+/// change before the cutoff with the same size and mtime is indistinguishable
+/// from the restore's own write, and is kept as the parent's content. This is
+/// the documented misuse, not a guarantee.
+#[rstest]
+fn a_change_before_the_cutoff_is_taken_as_the_restore_s(
+    set_up_repo: Result<RepoOpen>,
+) -> Result<()> {
+    let (repo, first) = first_backup(set_up_repo)?;
+    let mut files: Vec<File> = original().iter().map(File::restored).collect();
+    files[1].ctime = 2997;
+    files[1].byte = b'B';
+    let (opened, second) = archive(
+        &repo,
+        files,
+        parent(&first).restored_before(at(3000)),
+        false,
+    )?;
+    assert!(opened.is_empty(), "opened {opened:?}");
+    let repo = repo.drop_index().to_indexed_ids()?;
+    assert_eq!(content(&repo, &second)?, content(&repo, &first)?);
+    Ok(())
+}
+
+#[rstest]
+fn a_restore_time_in_the_future_is_an_error(set_up_repo: Result<RepoOpen>) -> Result<()> {
+    let (repo, first) = first_backup(set_up_repo)?;
+    let restored = original().iter().map(File::restored).collect();
+    let future = Timestamp::now() + jiff::SignedDuration::from_secs(3600);
+    let result = archive(
+        &repo,
+        restored,
+        parent(&first).restored_before(future),
+        false,
+    );
+    assert!(result.unwrap_err().to_string().contains("is in the future"),);
     Ok(())
 }
 
@@ -363,16 +406,19 @@ fn a_real_restore_is_not_read_again(set_up_repo: Result<RepoOpen>) -> Result<()>
     let opts = RestoreOptions::default();
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false)?;
     repo.restore(plan, &opts, ls, &dest)?;
-    // the restore's end, taken after it, a little later than any ctime the
-    // restore set (coarse kernel timestamps)
-    std::thread::sleep(Duration::from_millis(50));
+    // TIME, taken once the margin has passed since the restore wrote
+    std::thread::sleep(
+        rustic_core::RESTORED_BEFORE_MARGIN.unsigned_abs() + Duration::from_millis(500),
+    );
     let restored_before = Timestamp::now();
-    std::thread::sleep(Duration::from_millis(50));
 
-    // after the restore: "two" rewritten with other bytes of the same size,
-    // its mtime set back
+    // right after TIME, "two" rewritten with other bytes of the same size and
+    // its mtime set back. Nothing has queried its inode since the restore, so
+    // the kernel may give it a coarse ctime up to a tick *before* TIME: the
+    // margin makes it read anyway. (The mtime comes from the source, not from
+    // a stat of "two", which would make its next ctime fine-grained.)
+    let mtime = fs::metadata(source.path().join("two"))?.modified()?;
     let two = target.path().join("two");
-    let mtime = fs::metadata(&two)?.modified()?;
     fs::write(&two, vec![b'X'; 100_000])?;
     fs::File::options()
         .write(true)
