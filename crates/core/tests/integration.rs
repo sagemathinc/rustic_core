@@ -38,6 +38,7 @@ mod integration {
     mod prune;
     mod repair_snapshots;
     mod restore;
+    mod restored;
     mod rewrite;
     mod snapshots;
     mod vfs;

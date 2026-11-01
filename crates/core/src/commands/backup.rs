@@ -1,7 +1,8 @@
 //! `backup` subcommand
 use derive_setters::Setters;
 use itertools::Itertools;
-use log::info;
+use jiff::Timestamp;
+use log::{info, warn};
 
 use std::path::PathBuf;
 
@@ -77,9 +78,40 @@ pub struct ParentOptions {
     #[cfg_attr(feature = "clap", clap(long, conflicts_with = "force"))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub ignore_inode: bool,
+
+    /// The backup source is a complete restore of the (single, explicit)
+    /// parent snapshot into an empty directory, and that restore finished at
+    /// this time (RFC 3339). A file whose ctime is before it still holds what
+    /// the restore wrote, so it matches its parent node on type, size and
+    /// mtime alone; its ctime and inode, new on the restored tree, are not
+    /// compared. A file changed later has a later ctime and is compared as
+    /// usual. Use it for the first backup after moving or restoring a whole
+    /// tree, which otherwise reads every file again. Ignored, with a warning,
+    /// unless exactly one parent is given with `--parent`.
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, value_name = "TIME", conflicts_with = "force")
+    )]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
+    pub restored_before: Option<Timestamp>,
 }
 
 impl ParentOptions {
+    /// The restore time to apply (see [`ParentOptions::restored_before`]):
+    /// only with exactly one explicit parent, which must be the snapshot the
+    /// source was restored from.
+    fn effective_restored_before(&self) -> Option<Timestamp> {
+        let restored_before = self.restored_before?;
+        if self.force || self.parents.len() != 1 {
+            warn!(
+                "ignoring --restored-before: it needs exactly one --parent, the restored snapshot"
+            );
+            return None;
+        }
+        Some(restored_before)
+    }
+
     /// Get parent snapshot.
     ///
     /// # Type Parameters
@@ -135,6 +167,7 @@ impl ParentOptions {
                 parent_trees,
                 self.ignore_ctime,
                 self.ignore_inode,
+                self.effective_restored_before(),
             ),
         )
     }
