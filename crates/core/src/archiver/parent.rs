@@ -3,6 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
 };
 
+use jiff::Timestamp;
 use log::warn;
 
 use crate::{
@@ -32,6 +33,10 @@ pub struct Parent {
     ignore_ctime: bool,
     /// Ignore inode number when comparing nodes.
     ignore_inode: bool,
+    /// The source was restored from the parent: files with a ctime before
+    /// this cutoff were written by the restore (see
+    /// `ParentOptions::restored_before`).
+    restored_before: Option<Timestamp>,
     /// What the last file processed was vouched for by its parent match.
     last_vouch: Vouch,
 }
@@ -100,12 +105,15 @@ impl Parent {
     /// * `tree_id` - The tree id of the parent tree.
     /// * `ignore_ctime` - Ignore ctime when comparing nodes.
     /// * `ignore_inode` - Ignore inode number when comparing nodes.
+    /// * `restored_before` - The source was restored from this parent, and
+    ///   files with a ctime before this cutoff were written by the restore.
     pub(crate) fn new(
         be: &impl DecryptReadBackend,
         index: &impl ReadGlobalIndex,
         tree_id: impl IntoIterator<Item = TreeId>,
         ignore_ctime: bool,
         ignore_inode: bool,
+        restored_before: Option<Timestamp>,
     ) -> Self {
         // if tree_id is given, try to load tree from backend.
         let (trees, tree_ids) = tree_id
@@ -128,8 +136,21 @@ impl Parent {
             stack: Vec::new(),
             ignore_ctime,
             ignore_inode,
+            restored_before,
             last_vouch: Vouch::Nothing,
         }
+    }
+
+    /// Whether `node` was last changed by the restore it came from: its ctime
+    /// is present and strictly before the cutoff [`Parent::restored_before`].
+    /// Such a file still holds what the restore wrote, i.e. the parent's
+    /// content at its path, so its ctime and inode (new on the restored tree)
+    /// are not compared with the parent's. Any later change moves its ctime
+    /// past the cutoff.
+    fn restored_unchanged(&self, node: &Node) -> bool {
+        self.restored_before
+            .zip(node.meta.ctime)
+            .is_some_and(|(restored_before, ctime)| ctime < restored_before)
     }
 
     /// Whether a matched parent node is strong evidence that the file still
@@ -236,8 +257,9 @@ impl Parent {
     /// TODO: This function does not check whether the given node is a directory.
     fn is_parent(&mut self, node: &Node, name: &OsStr) -> ParentResult<&Node> {
         // use new variables as the mutable borrow is used later
-        let ignore_ctime = self.ignore_ctime;
-        let ignore_inode = self.ignore_inode;
+        let restored = self.restored_unchanged(node);
+        let ignore_ctime = self.ignore_ctime || restored;
+        let ignore_inode = self.ignore_inode || restored;
 
         let mut p_node = self.p_node(name).peekable();
         if p_node.peek().is_none() {
@@ -437,6 +459,7 @@ mod tests {
             stack: Vec::new(),
             ignore_ctime: false,
             ignore_inode,
+            restored_before: None,
             last_vouch: Vouch::Nothing,
         };
 
@@ -449,7 +472,7 @@ mod tests {
         let meta = Metadata {
             device_id,
             inode,
-            ctime: ctime.map(|s| jiff::Timestamp::from_second(s).unwrap()),
+            ctime: ctime.map(|s| Timestamp::from_second(s).unwrap()),
             ..Metadata::default()
         };
         Node::new_node(OsStr::new("file"), NodeType::File, meta)

@@ -162,7 +162,7 @@ pub use crate::{
         },
     },
     commands::{
-        backup::{BackupOptions, ParentOptions},
+        backup::{BackupOptions, ParentOptions, RESTORED_BEFORE_MARGIN},
         check::{CheckOptions, CheckResults, ReadSubsetOption},
         config::ConfigOptions,
         copy::CopySnapshot,
