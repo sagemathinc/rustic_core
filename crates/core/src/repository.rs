@@ -552,6 +552,7 @@ impl<S> Repository<S> {
         let cache = (!self.opts.no_cache)
             .then(|| Cache::new(config.id, self.opts.cache_dir.clone()).ok())
             .flatten();
+        let uncached_be = self.be.clone();
 
         if let Some(cache) = &cache {
             self.be = CachedBackend::new_cache(self.be.clone(), cache.clone());
@@ -569,6 +570,7 @@ impl<S> Repository<S> {
             dbe,
             config,
             key_id,
+            uncached_be,
         };
 
         Ok(Repository {
@@ -731,6 +733,11 @@ impl<S: Open> Repository<S> {
     // TODO: add documentation!
     pub(crate) fn dbe(&self) -> &DecryptBackend<Key> {
         &self.status.open_status().dbe
+    }
+
+    /// The repository backend without the cache (see `OpenStatus::uncached_be`).
+    pub(crate) fn uncached_be(&self) -> &Arc<dyn WriteBackend> {
+        &self.status.open_status().uncached_be
     }
 
     pub(crate) fn cache(&self) -> Option<&Cache> {
