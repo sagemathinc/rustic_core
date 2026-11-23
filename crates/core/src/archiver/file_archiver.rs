@@ -3,7 +3,10 @@ use std::{
     fs::File,
     io::Read,
     path::Path,
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use jiff::Timestamp;
@@ -25,7 +28,7 @@ use crate::{
         BlobId, BlobType, DataId,
         packer::{PackSizer, Packer, PackerStats},
     },
-    chunker::{Chunk, ChunkIter},
+    chunker::{Chunk, ChunkIter, chunk_len_zeroes},
     crypto::hasher::hash,
     error::{ErrorKind, RusticError, RusticResult},
     index::{ReadGlobalIndex, indexer::SharedIndexer},
@@ -49,6 +52,46 @@ pub(crate) struct FileArchiver<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> 
     hardlinks: Option<Arc<HardlinkCache>>,
     /// Content by extent signature (`--reuse-extents`), if enabled and pinned.
     extents: Option<Arc<ExtentReuse>>,
+    /// The chunk the chunker cuts from a run of zeros.
+    zero_chunk: ZeroChunk,
+}
+
+/// The chunk the chunker cuts from a run of zeros: its length, its id, and
+/// whether this run already stored it. Holes and zero runs repeat it many
+/// times, so it is built and handed to the packer at most once per run.
+#[derive(Debug, Clone)]
+struct ZeroChunk {
+    len: usize,
+    id: DataId,
+    /// Shared by all clones of the archiver.
+    stored: Arc<AtomicBool>,
+    /// How often [`ZeroChunk::must_store`] said yes.
+    #[cfg(test)]
+    stores: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ZeroChunk {
+    fn new(len: usize) -> Self {
+        Self {
+            len,
+            id: DataId::from(hash(&vec![0; len])),
+            stored: Arc::default(),
+            #[cfg(test)]
+            stores: Arc::default(),
+        }
+    }
+
+    /// Whether the caller must store the zero chunk: only the first caller in
+    /// this run, and only if the repository doesn't have it yet. The index is
+    /// the one from before the run, so it can't tell what this run stored.
+    fn must_store(&self, index: &impl ReadGlobalIndex) -> bool {
+        let must = !self.stored.swap(true, Ordering::Relaxed) && !index.has_data(&self.id);
+        #[cfg(test)]
+        if must {
+            _ = self.stores.fetch_add(1, Ordering::Relaxed);
+        }
+        must
+    }
 }
 
 /// A file opened for `--reuse-extents`, with its signature.
@@ -362,12 +405,15 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             PackSizer::from_config(config, BlobType::Data, index.total_size(BlobType::Data));
         let data_packer = Packer::new(be, BlobType::Data, indexer, pack_sizer)?;
 
+        let zero_chunk = ZeroChunk::new(chunk_len_zeroes(config));
+
         Ok(Self {
             index,
             data_packer,
             config: config.clone(),
             hardlinks: None,
             extents: None,
+            zero_chunk,
         })
     }
 
@@ -563,7 +609,6 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         node: Node,
         p: &Progress,
     ) -> RusticResult<(Node, u64)> {
-        let mut zero_chunk = None;
         let mut content = Vec::new();
         let mut filesize = 0u64;
         for chunk in ChunkIter::from_config(
@@ -573,25 +618,41 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         )? {
             let (id, size) = match chunk? {
                 Chunk::Data(chunk) => {
-                    let id = hash(&chunk);
                     let size = chunk.len() as u64;
-                    if !self.index.has_data(&DataId::from(id)) {
-                        self.data_packer.add(chunk.into(), BlobId::from(id))?;
-                    }
-                    (DataId::from(id), size)
+                    // Checking for zeros is much faster than hashing, which speeds up sparse
+                    // files and disk images that are read rather than skipped.
+                    let id = if chunk.len() == self.zero_chunk.len && is_zero(&chunk) {
+                        if self.zero_chunk.must_store(self.index) {
+                            self.data_packer
+                                .add(chunk.into(), BlobId::from(self.zero_chunk.id))?;
+                        }
+                        self.zero_chunk.id
+                    } else {
+                        let id = DataId::from(hash(&chunk));
+                        if !self.index.has_data(&id) {
+                            self.data_packer.add(chunk.into(), BlobId::from(id))?;
+                        }
+                        id
+                    };
+                    (id, size)
                 }
                 Chunk::Zeros(size) => {
-                    let id = match zero_chunk {
-                        Some((cached_size, id)) if cached_size == size => id,
-                        _ => {
-                            let chunk = vec![0; size];
-                            let id = hash(&chunk);
-                            if !self.index.has_data(&DataId::from(id)) {
-                                self.data_packer.add(chunk.into(), BlobId::from(id))?;
-                            }
-                            zero_chunk = Some((size, DataId::from(id)));
-                            DataId::from(id)
+                    // A skipped hole: the same id as the same zeros read from the file. The
+                    // chunker cuts holes into zero chunks, so the zeros are only built to
+                    // store that chunk the first time.
+                    let id = if size == self.zero_chunk.len {
+                        if self.zero_chunk.must_store(self.index) {
+                            self.data_packer
+                                .add(vec![0; size].into(), BlobId::from(self.zero_chunk.id))?;
                         }
+                        self.zero_chunk.id
+                    } else {
+                        let chunk = vec![0; size];
+                        let id = DataId::from(hash(&chunk));
+                        if !self.index.has_data(&id) {
+                            self.data_packer.add(chunk.into(), BlobId::from(id))?;
+                        }
+                        id
                     };
                     (id, size as u64)
                 }
@@ -620,6 +681,12 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     pub(crate) fn finalize(self) -> RusticResult<PackerStats> {
         self.data_packer.finalize()
     }
+}
+
+/// Checks if `data` contains only zeros. Unlike `iter().all()`, the inner loop is vectorized.
+fn is_zero(data: &[u8]) -> bool {
+    data.chunks(4096)
+        .all(|block| block.iter().fold(0, |acc, &b| acc | b) == 0)
 }
 
 #[cfg(test)]
@@ -791,5 +858,107 @@ mod tests {
             cache.claim_key(sig, ExtentOrigin::Read, serves_all),
             Claim::Reuse(c) if c == content(b"read")
         ));
+    }
+
+    #[test]
+    fn is_zero_finds_any_nonzero_byte() {
+        let mut data = vec![0; 3 * 4096 + 7];
+        assert!(is_zero(&data));
+        assert!(is_zero(&[]));
+        for i in [0, 4095, 4096, data.len() - 1] {
+            data[i] = 1;
+            assert!(!is_zero(&data), "byte {i}");
+            data[i] = 0;
+        }
+    }
+
+    /// Repeated holes and zero runs, before the repository has the zero chunk:
+    /// the zero chunk is handed to the packer once per run, not once per hole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_holes_store_the_zero_chunk_once() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        use crate::{
+            backend::{MockBackend, decrypt::DecryptBackend},
+            chunker::rabin::random_poly,
+            crypto::aespoly1305::Key,
+            index::{IndexEntry, ReadIndex, indexer::Indexer},
+            repofile::{Chunker, configfile::RepositoryId},
+        };
+
+        /// A repository without blobs.
+        #[derive(Debug, Clone)]
+        struct EmptyIndex;
+
+        impl ReadIndex for EmptyIndex {
+            fn get_id(&self, _tpe: BlobType, _id: &BlobId) -> Option<IndexEntry> {
+                None
+            }
+
+            fn total_size(&self, _tpe: BlobType) -> u64 {
+                0
+            }
+
+            fn has(&self, _tpe: BlobType, _id: &BlobId) -> bool {
+                false
+            }
+        }
+
+        impl ReadGlobalIndex for EmptyIndex {}
+
+        for chunker in [Chunker::Rabin, Chunker::FixedSize] {
+            let mut mock = MockBackend::new();
+            _ = mock.expect_write_bytes().returning(|_, _, _, _| Ok(()));
+            let be = DecryptBackend::new(Arc::new(mock), Key::new());
+            let mut config = ConfigFile::new(2, RepositoryId::default(), random_poly().unwrap());
+            config.chunker = Some(chunker);
+            let indexer = Indexer::new(be.clone()).into_shared();
+            let archiver = FileArchiver::new(be, &EmptyIndex, indexer, &config).unwrap();
+            let zeros = archiver.zero_chunk.clone();
+
+            // Two sparse files: one only holes, one with holes before and after data.
+            let len = zeros.len as u64;
+            let dir = tempfile::tempdir().unwrap();
+            let holes = dir.path().join("holes");
+            File::create(&holes).unwrap().set_len(6 * len).unwrap();
+            let mixed = dir.path().join("mixed");
+            let f = File::create(&mixed).unwrap();
+            f.set_len(8 * len).unwrap();
+            f.write_all_at(&[1; 1000], 4 * len).unwrap();
+            drop(f);
+            // And the same zeros written out, so they are read, not skipped.
+            let dense = dir.path().join("dense");
+            std::fs::write(&dense, vec![0; 3 * zeros.len]).unwrap();
+
+            for (inode, path) in [&holes, &mixed, &dense].into_iter().enumerate() {
+                let meta = path.metadata().unwrap();
+                if path != &dense {
+                    assert!(
+                        meta.blocks() * 512 < meta.len() / 2,
+                        "the test file system must keep holes"
+                    );
+                }
+                let reader = SourceReader::<File>::file(File::open(path).unwrap()).unwrap();
+                let node = file(
+                    1,
+                    inode as u64 + 1,
+                    meta.len(),
+                    1_700_000_000,
+                    1_700_000_000,
+                );
+                let (node, size) = archiver
+                    .backup_reader(reader, node, &Progress::hidden())
+                    .unwrap();
+                assert_eq!(size, meta.len());
+                let content = node.content.unwrap();
+                assert!(content.iter().filter(|id| **id == zeros.id).count() >= 2);
+                if path == &holes {
+                    assert_eq!(content, vec![zeros.id; 6]);
+                }
+            }
+            assert_eq!(zeros.stores.load(Ordering::Relaxed), 1, "{chunker:?}");
+            _ = archiver.finalize().unwrap();
+        }
     }
 }
