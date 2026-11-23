@@ -25,7 +25,7 @@ use crate::{
         BlobId, BlobType, DataId,
         packer::{PackSizer, Packer, PackerStats},
     },
-    chunker::{Chunk, ChunkIter},
+    chunker::{Chunk, ChunkIter, chunk_len_zeroes},
     crypto::hasher::hash,
     error::{ErrorKind, RusticError, RusticResult},
     index::{ReadGlobalIndex, indexer::SharedIndexer},
@@ -49,6 +49,8 @@ pub(crate) struct FileArchiver<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> 
     hardlinks: Option<Arc<HardlinkCache>>,
     /// Content by extent signature (`--reuse-extents`), if enabled and pinned.
     extents: Option<Arc<ExtentReuse>>,
+    /// Length and id of the chunks the chunker cuts from a run of zeros.
+    zero_chunk: (usize, DataId),
 }
 
 /// A file opened for `--reuse-extents`, with its signature.
@@ -362,12 +364,19 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
             PackSizer::from_config(config, BlobType::Data, index.total_size(BlobType::Data));
         let data_packer = Packer::new(be, BlobType::Data, indexer, pack_sizer)?;
 
+        let chunk_len_zeroes = chunk_len_zeroes(config);
+        let zero_chunk = (
+            chunk_len_zeroes,
+            DataId::from(hash(&vec![0; chunk_len_zeroes])),
+        );
+
         Ok(Self {
             index,
             data_packer,
             config: config.clone(),
             hardlinks: None,
             extents: None,
+            zero_chunk,
         })
     }
 
@@ -563,7 +572,6 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         node: Node,
         p: &Progress,
     ) -> RusticResult<(Node, u64)> {
-        let mut zero_chunk = None;
         let mut content = Vec::new();
         let mut filesize = 0u64;
         for chunk in ChunkIter::from_config(
@@ -573,26 +581,29 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         )? {
             let (id, size) = match chunk? {
                 Chunk::Data(chunk) => {
-                    let id = hash(&chunk);
+                    // Checking for zeros is much faster than hashing, which speeds up sparse
+                    // files and disk images that are read rather than skipped.
+                    let id = if chunk.len() == self.zero_chunk.0 && is_zero(&chunk) {
+                        self.zero_chunk.1
+                    } else {
+                        DataId::from(hash(&chunk))
+                    };
                     let size = chunk.len() as u64;
-                    if !self.index.has_data(&DataId::from(id)) {
+                    if !self.index.has_data(&id) {
                         self.data_packer.add(chunk.into(), BlobId::from(id))?;
                     }
-                    (DataId::from(id), size)
+                    (id, size)
                 }
                 Chunk::Zeros(size) => {
-                    let id = match zero_chunk {
-                        Some((cached_size, id)) if cached_size == size => id,
-                        _ => {
-                            let chunk = vec![0; size];
-                            let id = hash(&chunk);
-                            if !self.index.has_data(&DataId::from(id)) {
-                                self.data_packer.add(chunk.into(), BlobId::from(id))?;
-                            }
-                            zero_chunk = Some((size, DataId::from(id)));
-                            DataId::from(id)
-                        }
+                    // A skipped hole: the same id as the same zeros read from the file.
+                    let id = if size == self.zero_chunk.0 {
+                        self.zero_chunk.1
+                    } else {
+                        DataId::from(hash(&vec![0; size]))
                     };
+                    if !self.index.has_data(&id) {
+                        self.data_packer.add(vec![0; size].into(), BlobId::from(id))?;
+                    }
                     (id, size as u64)
                 }
             };
@@ -620,6 +631,12 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     pub(crate) fn finalize(self) -> RusticResult<PackerStats> {
         self.data_packer.finalize()
     }
+}
+
+/// Checks if `data` contains only zeros. Unlike `iter().all()`, the inner loop is vectorized.
+fn is_zero(data: &[u8]) -> bool {
+    data.chunks(4096)
+        .all(|block| block.iter().fold(0, |acc, &b| acc | b) == 0)
 }
 
 #[cfg(test)]
@@ -791,5 +808,17 @@ mod tests {
             cache.claim_key(sig, ExtentOrigin::Read, serves_all),
             Claim::Reuse(c) if c == content(b"read")
         ));
+    }
+
+    #[test]
+    fn is_zero_finds_any_nonzero_byte() {
+        let mut data = vec![0; 3 * 4096 + 7];
+        assert!(is_zero(&data));
+        assert!(is_zero(&[]));
+        for i in [0, 4095, 4096, data.len() - 1] {
+            data[i] = 1;
+            assert!(!is_zero(&data), "byte {i}");
+            data[i] = 0;
+        }
     }
 }
