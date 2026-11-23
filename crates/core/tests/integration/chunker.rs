@@ -109,7 +109,12 @@ fn test_backup_sparse_matches_dense(
 
     // Data islands between long zero runs, the last one ending at EOF.
     let len = 12 << 20;
-    let islands = [0..100_000, 4_000_123..4_100_000, (9 << 20)..(9 << 20) + 7, len - 5..len];
+    let islands = [
+        0..100_000,
+        4_000_123..4_100_000,
+        (9 << 20)..(9 << 20) + 7,
+        len - 5..len,
+    ];
     let mut data = vec![0; len];
     let mut x: u32 = 7;
     for range in islands.clone() {
@@ -128,7 +133,10 @@ fn test_backup_sparse_matches_dense(
     }
     drop(sparse);
     let blocks = fs::metadata(sparse_dir.path().join("file"))?.blocks();
-    assert!(blocks * 512 < len as u64 / 2, "the test file system must keep holes");
+    assert!(
+        blocks * 512 < len as u64 / 2,
+        "the test file system must keep holes"
+    );
 
     let opts = BackupOptions::default().as_path(PathBuf::from_str("test")?);
     let dense = repo.backup(
@@ -136,6 +144,8 @@ fn test_backup_sparse_matches_dense(
         &PathList::from_iter(Some(dense_dir.path().to_path_buf())),
         SnapshotFile::default(),
     )?;
+    // Reopen the index, so the sparse backup sees the blobs of the dense one.
+    let repo = repo.to_indexed_ids()?;
     let opts = opts.parent_opts(ParentOptions::default().force(true));
     let sparse = repo.backup(
         &opts,
@@ -147,13 +157,12 @@ fn test_backup_sparse_matches_dense(
     let summary = sparse.summary.as_ref().unwrap();
     assert_eq!(summary.files_new, 1);
     assert_eq!(summary.data_blobs, 0);
-    assert_eq!(summary.data_added, 0);
+    assert_eq!(summary.data_added_files, 0);
 
     let repo = repo.to_indexed()?;
     repo.check(CheckOptions::default().read_data(true))?
         .is_ok()?;
-    let dense_node =
-        repo.node_from_snapshot_path(&format!("{}:test/file", dense.id), |_| true)?;
+    let dense_node = repo.node_from_snapshot_path(&format!("{}:test/file", dense.id), |_| true)?;
     let sparse_node =
         repo.node_from_snapshot_path(&format!("{}:test/file", sparse.id), |_| true)?;
     assert_eq!(sparse_node.content, dense_node.content);
