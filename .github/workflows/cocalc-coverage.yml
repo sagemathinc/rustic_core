@@ -31,6 +31,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
+      # this repository has no rust-toolchain file; the measured toolchain is pinned here,
+      # and finish.py requires rustc to report exactly this release
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      EXPECTED_RUSTC_RELEASE: "1.95.0"
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "0"
       OUT: ${{ github.workspace }}/coverage-out/${{ matrix.run }}
