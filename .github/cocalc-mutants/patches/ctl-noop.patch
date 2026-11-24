@@ -1,0 +1,12 @@
+diff --git a/crates/core/src/crypto/hasher.rs b/crates/core/src/crypto/hasher.rs
+index 1613352..e929607 100644
+--- a/crates/core/src/crypto/hasher.rs
++++ b/crates/core/src/crypto/hasher.rs
+@@ -47,6 +47,7 @@ impl Hasher {
+ ///
+ /// The hash Id of the data.
+ pub fn hash_reader(mut reader: impl Read) -> Result<Id> {
++    // cocalc mutant control: a comment only
+     let mut buffer = [0; 4096];
+     let mut hasher = Hasher::new();
+ 

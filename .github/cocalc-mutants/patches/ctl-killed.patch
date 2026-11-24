@@ -1,0 +1,13 @@
+diff --git a/crates/core/src/crypto/hasher.rs b/crates/core/src/crypto/hasher.rs
+index 1613352..a06402d 100644
+--- a/crates/core/src/crypto/hasher.rs
++++ b/crates/core/src/crypto/hasher.rs
+@@ -61,7 +61,7 @@ pub fn hash_reader(mut reader: impl Read) -> Result<Id> {
+                 if count == 0 {
+                     break Ok(hasher.finalize());
+                 }
+-                hasher.update(&buffer[..count]);
++                hasher.update(&buffer[..count / 2]);
+             }
+         }
+     }
