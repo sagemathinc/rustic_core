@@ -187,7 +187,7 @@ pub(crate) fn index_checked_from_collector<S: Open>(
 
     let p = repo.progress_counter("reading index...");
     for index in be.stream_all::<IndexFile>(&p)? {
-        collector.extend(checker.check_pack(index?.1, false).0.packs);
+        collector.extend(checker.check_pack(index?.1, false).0.into_readable_packs());
     }
     p.finish();
 

@@ -268,7 +268,7 @@ impl GlobalIndex {
     ) -> RusticResult<Self> {
         p.set_title("reading index...");
         for index in be.stream_all::<IndexFile>(p)? {
-            collector.extend(index?.1.packs);
+            collector.extend(index?.1.into_readable_packs());
         }
 
         p.finish();

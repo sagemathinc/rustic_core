@@ -462,7 +462,7 @@ fn check_packs<S: Open>(
     let p = repo.progress_counter("reading index...");
     for index in be.stream_all::<IndexFile>(&p)? {
         let index = index?.1;
-        index_collector.extend(index.packs.clone());
+        index_collector.extend(index.readable_packs().cloned());
         for p in index.all_packs() {
             let check_time = p.has_mark(); // Check if time is set for packs marked to delete
             let blob_type = p.blob_type();
