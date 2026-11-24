@@ -131,11 +131,10 @@ fn test_prune_parallel_to_backup(
     // Check fails as the needed blob is marked for deletion here. TODO: Make check respect marked packs and print only a warning
     // repo.check(check_opts)?.is_ok()?;
 
-    // run prune again -> should keep the marks
+    // run prune again -> marks the needed packs for recovery; readers use them already
     let plan = repo.prune_plan(&prune_opts)?;
     repo.prune(&prune_opts, plan)?;
-    // Check fails as the needed blob is still marked
-    // repo.check(check_opts)?.is_ok()?;
+    repo.check(check_opts)?.is_ok()?;
 
     // re-run again with keep-delete = 0. Now packs should be recovered.
     let prune_opts = prune_opts.keep_marked(Span::default());

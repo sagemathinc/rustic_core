@@ -68,6 +68,19 @@ impl IndexFile {
         }
     }
 
+    /// The packs whose blobs readers may use: unmarked packs and packs marked for
+    /// recovery. A pack is marked for recovery because a snapshot uses it, and prune
+    /// only deletes it after marking it for deletion again, so it stays readable.
+    /// Packs marked for deletion are left out.
+    pub(crate) fn readable_packs(&self) -> impl Iterator<Item = &IndexPack> {
+        self.packs.iter().chain(&self.packs_to_recover)
+    }
+
+    /// [`Self::readable_packs`], taking them out of the index file.
+    pub(crate) fn into_readable_packs(self) -> impl Iterator<Item = IndexPack> {
+        self.packs.into_iter().chain(self.packs_to_recover)
+    }
+
     pub(crate) fn all_packs(self) -> impl Iterator<Item = IndexPack> {
         self.packs
             .into_iter()
@@ -225,5 +238,27 @@ impl Ord for IndexBlob {
     /// The ordering of the two blobs
     fn cmp(&self, other: &Self) -> Ordering {
         self.location.cmp(&other.location)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readers_use_unmarked_packs_and_packs_marked_for_recovery() {
+        let pack = |size: u32, mark: IndexMarkType| IndexPack {
+            size: Some(size),
+            mark,
+            ..Default::default()
+        };
+        let mut file = IndexFile::default();
+        file.add(pack(1, IndexMarkType::None));
+        file.add(pack(2, IndexMarkType::Delete));
+        file.add(pack(3, IndexMarkType::Recover));
+        let borrowed: Vec<_> = file.readable_packs().map(|p| p.size).collect();
+        assert_eq!(borrowed, [Some(1), Some(3)]);
+        let owned: Vec<_> = file.into_readable_packs().map(|p| p.size).collect();
+        assert_eq!(owned, [Some(1), Some(3)]);
     }
 }

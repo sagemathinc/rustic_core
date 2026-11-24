@@ -864,15 +864,7 @@ impl PrunePlan {
         if too_young {
             _ = status.insert(PackStatus::TooYoung);
         }
-        let pack_to_do = match (pack.mark, pi.used_blobs) {
-            (IndexMarkType::None, _) => panic!("not possible"),
-            (IndexMarkType::Delete, 1..) => PackToDo::MarkRecover, // was wrong marked; correct
-            (IndexMarkType::Recover, 0) => PackToDo::MarkDelete,   // was wrong marked; correct
-            (IndexMarkType::Delete, 0) if too_young => PackToDo::KeepMarkedDelete,
-            (IndexMarkType::Recover, 1..) if too_young => PackToDo::KeepMarkedRecover,
-            (IndexMarkType::Delete, 0) => PackToDo::Delete,
-            (IndexMarkType::Recover, 1..) => PackToDo::Recover,
-        };
+        let pack_to_do = marked_pack_todo(pack.mark, pi.used_blobs, too_young);
         pack.set_todo(pack_to_do, &pi, status, &mut self.stats);
     }
 
@@ -1493,6 +1485,24 @@ fn find_used_blobs<S>(
     Ok(ids)
 }
 
+/// What to do with a marked pack, given how many of its blobs are used and
+/// whether its mark is younger than `keep-marked`.
+///
+/// Readers use packs marked for recovery, so such a pack is never deleted
+/// directly: without users it is first marked for deletion again (only
+/// `--instant-delete` turns that mark into an immediate deletion).
+fn marked_pack_todo(mark: IndexMarkType, used_blobs: u32, too_young: bool) -> PackToDo {
+    match (mark, used_blobs) {
+        (IndexMarkType::None, _) => panic!("not possible"),
+        (IndexMarkType::Delete, 1..) => PackToDo::MarkRecover, // was wrong marked; correct
+        (IndexMarkType::Recover, 0) => PackToDo::MarkDelete,   // was wrong marked; correct
+        (IndexMarkType::Delete, 0) if too_young => PackToDo::KeepMarkedDelete,
+        (IndexMarkType::Recover, 1..) if too_young => PackToDo::KeepMarkedRecover,
+        (IndexMarkType::Delete, 0) => PackToDo::Delete,
+        (IndexMarkType::Recover, 1..) => PackToDo::Recover,
+    }
+}
+
 fn collect_used_node_blobs(nodes: impl IntoIterator<Item = Node>, ids: &mut BTreeMap<BlobId, u8>) {
     for node in nodes {
         match node.node_type {
@@ -1547,6 +1557,35 @@ mod tests {
 
         collect_used_node_blobs([node], &mut ids);
         assert!(ids.contains_key(&BlobId::from(*tree_id)));
+    }
+
+    /// Readers use packs marked for recovery, so prune must never delete one
+    /// directly: without users it is marked for deletion first.
+    #[test]
+    fn a_pack_marked_for_recovery_is_never_deleted_directly() {
+        for too_young in [true, false] {
+            for used_blobs in [0, 1, 7] {
+                let todo = marked_pack_todo(IndexMarkType::Recover, used_blobs, too_young);
+                assert_ne!(todo, PackToDo::Delete, "used {used_blobs}, too young {too_young}");
+                let mut pack = PrunePack::from_index_pack(
+                    IndexPack {
+                        mark: IndexMarkType::Recover,
+                        ..Default::default()
+                    },
+                    0,
+                );
+                pack.to_do = todo;
+                assert_ne!(pack.todo_with_instant_delete(false), PackToDo::Delete);
+            }
+            assert_eq!(
+                marked_pack_todo(IndexMarkType::Recover, 0, too_young),
+                PackToDo::MarkDelete
+            );
+        }
+        // only a pack already marked for deletion, unused and old enough, is deleted
+        assert_eq!(marked_pack_todo(IndexMarkType::Delete, 0, false), PackToDo::Delete);
+        assert_eq!(marked_pack_todo(IndexMarkType::Delete, 0, true), PackToDo::KeepMarkedDelete);
+        assert_eq!(marked_pack_todo(IndexMarkType::Delete, 3, false), PackToDo::MarkRecover);
     }
 
     /// Fork regression test for bug 7 (found by the crash suite,
