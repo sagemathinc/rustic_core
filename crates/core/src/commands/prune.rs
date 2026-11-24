@@ -1491,7 +1491,7 @@ fn find_used_blobs<S>(
 /// Readers use packs marked for recovery, so such a pack is never deleted
 /// directly: without users it is first marked for deletion again (only
 /// `--instant-delete` turns that mark into an immediate deletion).
-fn marked_pack_todo(mark: IndexMarkType, used_blobs: u32, too_young: bool) -> PackToDo {
+fn marked_pack_todo(mark: IndexMarkType, used_blobs: u16, too_young: bool) -> PackToDo {
     match (mark, used_blobs) {
         (IndexMarkType::None, _) => panic!("not possible"),
         (IndexMarkType::Delete, 1..) => PackToDo::MarkRecover, // was wrong marked; correct
